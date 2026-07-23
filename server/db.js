@@ -33,6 +33,13 @@ export function initDatabase(path) {
     db.exec('ALTER TABLE messages ADD COLUMN provider TEXT');
   }
 
+  const hasSanitizedColumn = db
+    .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'sanitized'")
+    .get();
+  if (!hasSanitizedColumn) {
+    db.exec('ALTER TABLE messages ADD COLUMN sanitized INTEGER NOT NULL DEFAULT 0');
+  }
+
   return db;
 }
 
@@ -65,17 +72,18 @@ export function listConversations() {
 export function getMessages(conversationId) {
   return db
     .prepare(
-      'SELECT id, role, content, provider, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'
+      'SELECT id, role, content, provider, sanitized, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'
     )
-    .all(conversationId);
+    .all(conversationId)
+    .map((m) => ({ ...m, sanitized: Boolean(m.sanitized) }));
 }
 
-export function appendMessage(conversationId, role, content, provider = null) {
+export function appendMessage(conversationId, role, content, provider = null, sanitized = false) {
   const id = randomUUID();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO messages (id, conversation_id, role, content, provider, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(id, conversationId, role, content, provider, now);
+    'INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, conversationId, role, content, provider, sanitized ? 1 : 0, now);
 
   const conversation = db.prepare('SELECT title FROM conversations WHERE id = ?').get(conversationId);
   const title = conversation?.title || (role === 'user' ? content.slice(0, 60) : null);

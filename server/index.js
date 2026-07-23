@@ -15,7 +15,8 @@ import {
 } from './db.js';
 import { sendChat as sendOllamaChat, checkOllamaHealth } from './ollamaClient.js';
 import { sendChat as sendGeminiChat, checkGeminiHealth } from './geminiClient.js';
-import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt.js';
+import { DEFAULT_SYSTEM_PROMPT, SANITIZED_SYSTEM_PROMPT } from './systemPrompt.js';
+import { SANITIZE_SYSTEM_PROMPT } from './sanitizePrompt.js';
 
 const PROVIDERS = {
   local: { sendChat: sendOllamaChat, label: 'local' },
@@ -41,7 +42,7 @@ const chatLimiter = rateLimit({
 });
 
 app.post('/api/chat', chatLimiter, async (req, res) => {
-  const { conversationId, prompt, provider = 'local' } = req.body || {};
+  const { conversationId, prompt, provider = 'local', sanitized = false } = req.body || {};
 
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     return res.status(400).json({ error: 'prompt is required' });
@@ -59,24 +60,65 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
   if (provider === 'cloud' && !process.env.GEMINI_API_KEY) {
     return res.status(400).json({ error: 'GEMINI_API_KEY is not configured — cloud provider is unavailable' });
   }
+  if (sanitized && provider !== 'cloud') {
+    return res.status(400).json({ error: 'the sanitize workflow only applies to the cloud provider' });
+  }
 
   const activeConversationId = conversationId || createConversation();
-  const priorMessages = getMessages(activeConversationId);
+
+  // Sanitized sends are deliberately isolated from this conversation's raw
+  // history and from DEFAULT_SYSTEM_PROMPT (which names Ben, his family,
+  // employer, and church) — only the reviewed/edited text the user explicitly
+  // confirmed reaches the cloud provider, nothing else.
+  const priorMessages = sanitized ? [] : getMessages(activeConversationId);
+  const systemPrompt = sanitized ? SANITIZED_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT;
 
   const messages = [
-    { role: 'system', content: DEFAULT_SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     ...priorMessages.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: prompt }
   ];
 
-  appendMessage(activeConversationId, 'user', prompt);
+  appendMessage(activeConversationId, 'user', prompt, null, sanitized);
 
   try {
     const text = await selectedProvider.sendChat(messages);
-    appendMessage(activeConversationId, 'assistant', text, selectedProvider.label);
-    res.json({ conversationId: activeConversationId, text, provider: selectedProvider.label });
+    appendMessage(activeConversationId, 'assistant', text, selectedProvider.label, sanitized);
+    res.json({ conversationId: activeConversationId, text, provider: selectedProvider.label, sanitized });
   } catch (error) {
     res.status(502).json({ error: `${selectedProvider.label} provider request failed: ${error.message}` });
+  }
+});
+
+app.post('/api/sanitize', chatLimiter, async (req, res) => {
+  const { conversationId, text } = req.body || {};
+  let sourceText;
+
+  if (conversationId) {
+    if (!conversationExists(conversationId)) {
+      return res.status(404).json({ error: 'conversation not found' });
+    }
+    const priorMessages = getMessages(conversationId);
+    if (priorMessages.length === 0) {
+      return res.status(400).json({ error: 'conversation has no messages to sanitize' });
+    }
+    sourceText = priorMessages.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n');
+  } else if (typeof text === 'string' && text.trim() !== '') {
+    sourceText = text;
+  } else {
+    return res.status(400).json({ error: 'conversationId or text is required' });
+  }
+
+  try {
+    // Always local, regardless of the Local/Cloud toggle — this preview step
+    // must never itself reach the cloud, and nothing here is persisted.
+    const sanitizedText = await sendOllamaChat([
+      { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
+      { role: 'user', content: sourceText }
+    ]);
+    res.json({ sanitized: sanitizedText });
+  } catch (error) {
+    res.status(502).json({ error: `Sanitization failed: ${error.message}` });
   }
 });
 

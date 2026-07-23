@@ -117,9 +117,16 @@
   margin-bottom: 0;
 }
 
-.provider-badge {
-  display: inline-block;
+.message-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-top: 8px;
+}
+
+.provider-badge,
+.sanitized-badge {
+  display: inline-block;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 12px;
@@ -135,6 +142,11 @@
 .provider-badge.cloud {
   background: rgba(59, 130, 246, 0.15);
   color: #2563eb;
+}
+
+.sanitized-badge {
+  background: rgba(234, 179, 8, 0.15);
+  color: #a16207;
 }
 
 .chat-input-row {
@@ -193,4 +205,73 @@
 .chat-input-row button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.sanitize-button {
+  background: transparent !important;
+  color: #a16207 !important;
+  border: 1px dashed rgba(234, 179, 8, 0.5) !important;
+  padding: 0 14px !important;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sanitize-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+  background: rgba(234, 179, 8, 0.06);
+}
+
+.sanitize-panel-label {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.sanitize-textarea {
+  font: inherit;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(234, 179, 8, 0.5);
+  background: var(--bg);
+  color: var(--text-h);
+  resize: vertical;
+}
+
+.sanitize-panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.sanitize-panel-actions button {
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cancel-button {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.send-to-cloud-button {
+  border: none;
+  background: var(--accent);
+  color: #fff;
+}
+
+.send-to-cloud-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sanitize-error {
+  padding: 8px 20px;
+  color: #dc2626;
+  font-size: 13px;
 }

@@ -7,11 +7,19 @@ async function request(path, options) {
   return data;
 }
 
-export function sendMessage({ conversationId, prompt, provider }) {
+export function sendMessage({ conversationId, prompt, provider, sanitized }) {
   return request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, prompt, provider })
+    body: JSON.stringify({ conversationId, prompt, provider, sanitized })
+  });
+}
+
+export function sanitizeForCloud({ conversationId, text }) {
+  return request('/api/sanitize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, text })
   });
 }
 
