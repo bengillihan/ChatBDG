@@ -44,15 +44,23 @@ function forContext(messages) {
 // any value it likes. Identity comes only from the signed
 // Cf-Access-Jwt-Assertion JWT, cryptographically verified against
 // Cloudflare's own keys. A JWT that's present but invalid is a hard
-// rejection, never a silent fallback — only a request with NO Access
-// headers at all (local development not going through the tunnel) uses the
-// configured local-dev identity.
+// rejection, never a silent fallback. A request with NO Access headers at
+// all fails closed too, by default — it's rejected rather than assumed to be
+// the owner. The only way to get the old local-dev behavior (no tunnel, no
+// JWT, identify as DEFAULT_LOCAL_USER_EMAIL/OWNER_EMAIL) is to explicitly set
+// ALLOW_INSECURE_LOCAL_AUTH=true, which should never be set outside a
+// developer's own machine — if it were ever set in the deployed environment,
+// a misconfigured or bypassed Access policy in front of the tunnel would
+// silently grant owner-level access to anyone who reached the origin.
 async function identifyRequest(req, res, next) {
   const token = req.get('Cf-Access-Jwt-Assertion');
 
   if (!token) {
-    req.userEmail = process.env.DEFAULT_LOCAL_USER_EMAIL || process.env.OWNER_EMAIL;
-    return next();
+    if (process.env.ALLOW_INSECURE_LOCAL_AUTH === 'true') {
+      req.userEmail = process.env.DEFAULT_LOCAL_USER_EMAIL || process.env.OWNER_EMAIL;
+      return next();
+    }
+    return res.status(401).json({ error: 'Access authentication required' });
   }
 
   try {
@@ -84,11 +92,17 @@ export function createApp() {
   app.use(express.json({ limit: '32kb' }));
   app.use(identifyRequest);
 
+  // Keyed by the verified user identity (set by identifyRequest, which runs
+  // before this route-level middleware), not by IP — every request reaches
+  // this server through the same Cloudflare tunnel connection, so an IP-based
+  // key would put every user in one shared bucket and let one user's traffic
+  // throttle another's.
   const chatLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 60,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: (req) => req.userEmail,
     message: { error: 'Too many requests — please slow down' }
   });
 

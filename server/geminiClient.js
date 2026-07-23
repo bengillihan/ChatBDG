@@ -71,6 +71,19 @@ export async function sendChat(messages) {
       REQUEST_TIMEOUT_MS
     );
 
+    // response.text is undefined (not thrown) when Gemini returns no text
+    // part — most commonly a safety block with no candidates. Surface that
+    // as a clear error instead of letting `undefined` reach the caller, which
+    // would otherwise fail later with an opaque error when it's persisted
+    // into the NOT NULL messages.content column.
+    if (response.text === undefined) {
+      const blockReason = response.promptFeedback?.blockReason;
+      const finishReason = response.candidates?.[0]?.finishReason;
+      throw new Error(
+        `Gemini returned no text response${blockReason ? ` (blocked: ${blockReason})` : finishReason ? ` (finishReason: ${finishReason})` : ''}`
+      );
+    }
+
     return response.text;
   } catch (error) {
     if (isQuotaError(error)) {

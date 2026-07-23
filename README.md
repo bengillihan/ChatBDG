@@ -35,6 +35,8 @@ npm run dev    # Vite dev server on :5173, proxies /api to :3000
 
 Requires Node.js 22.5+ (see §8 for why) and a running Ollama instance with the `qwen3-church` model available (`ollama list` to check, or build it from the repo's `Modelfile`: `ollama create qwen3-church -f Modelfile`).
 
+Running locally without the Cloudflare tunnel in front means every request arrives with no `Cf-Access-Jwt-Assertion` header — since that fails closed by default (see §5), also set `ALLOW_INSECURE_LOCAL_AUTH=true` in `.env` for local development, or every request will 401.
+
 **Deployed as a `launchd` service**, not a manually-started process — see §6. To pick up code changes on the Mac mini: `npm run build`, then `launchctl kickstart -k gui/$(id -u)/com.bengillihan.chatbdg` (or bootout + bootstrap the plist again).
 
 ## 2. Architecture at a glance
@@ -116,7 +118,7 @@ There is no login screen, no session cookie, no password anywhere in this codeba
 
 **The mistake to never repeat**: an earlier version trusted the `Cf-Access-Authenticated-User-Email` header directly. That header is attacker-controlled if anything can reach the origin without Access rewriting it — which means a real Access-authenticated user (Titus) could, via dev tools, set that header to the owner's email and get treated as the owner. `server/cfAccessAuth.js` fixes this by verifying the **signed** `Cf-Access-Jwt-Assertion` JWT against Cloudflare's published JWKS (`https://<CF_ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs`), checking signature, `iss`, and `aud` (the specific Access application's AUD tag), and reading `email` only from the verified payload. The plaintext header is no longer read anywhere in the app.
 
-The critical invariant in `identifyRequest` (`server/app.js`): if a `Cf-Access-Jwt-Assertion` header is present but fails verification, that's a hard `401` — **never** a silent fallback to a default identity. Only the true *absence* of any Access header (local development, not going through the tunnel) uses `DEFAULT_LOCAL_USER_EMAIL || OWNER_EMAIL`. If you ever change this logic, preserve that distinction — "invalid token" and "no token" must not be treated the same way, or the exact vulnerability this fixed comes back.
+The critical invariant in `identifyRequest` (`server/app.js`): if a `Cf-Access-Jwt-Assertion` header is present but fails verification, that's a hard `401` — **never** a silent fallback to a default identity. The true *absence* of any Access header **also fails closed by default** (`401`) — it does **not** assume local development. The old behavior (silently identifying as `DEFAULT_LOCAL_USER_EMAIL || OWNER_EMAIL` whenever the header was simply missing) meant that any request which reached this server without going through a correctly configured Access policy — a misconfigured policy, an Access outage that fails open, anything reaching the origin outside the tunnel — was silently treated as the owner. That fallback still exists, but only when `ALLOW_INSECURE_LOCAL_AUTH=true` is explicitly set, which should only ever be true on a developer's own machine, never in the deployed `.env`. If you ever change this logic, preserve the distinction between "invalid token," "no token, insecure auth allowed," and "no token, insecure auth not allowed" — collapsing any of these together reopens exactly the vulnerability this fixed.
 
 ## 6. Network exposure
 
@@ -172,7 +174,8 @@ All in `.env` (see `.env.example` for the annotated version; `.env` itself is gi
 | `OLLAMA_MODEL` | yes | `qwen3-church` |
 | `DATABASE_PATH` | yes | SQLite file path |
 | `OWNER_EMAIL` | yes | Determines who gets the personal vs. shared system prompt, and who owns pre-migration conversations |
-| `DEFAULT_LOCAL_USER_EMAIL` | no | Identity used ONLY when no Access JWT is present at all (local dev); defaults to `OWNER_EMAIL` |
+| `ALLOW_INSECURE_LOCAL_AUTH` | no (default: unset/fail-closed) | Set to `true` ONLY on a developer's own machine to allow requests with no Access JWT at all. Never set in the deployed environment — see §5 |
+| `DEFAULT_LOCAL_USER_EMAIL` | no | Identity used ONLY when `ALLOW_INSECURE_LOCAL_AUTH=true` and no Access JWT is present; defaults to `OWNER_EMAIL` |
 | `CF_ACCESS_TEAM_DOMAIN` | yes | Your Zero Trust team domain — used to fetch Cloudflare's JWKS for JWT verification |
 | `CF_ACCESS_AUD` | yes | The specific Access application's Audience tag — without this, a token valid for some *other* Access app under the same team could be replayed against this one |
 | `GEMINI_API_KEY` | no | Only needed to use the Cloud toggle/Get Cloud Feedback at all |

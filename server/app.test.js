@@ -46,6 +46,12 @@ beforeEach(async () => {
   process.env.CF_ACCESS_TEAM_DOMAIN = 'test-team.cloudflareaccess.com';
   process.env.CF_ACCESS_AUD = 'test-aud-tag';
   delete process.env.DEFAULT_LOCAL_USER_EMAIL;
+  // Most tests below aren't exercising auth itself — they send plain requests
+  // with no Cf-Access-Jwt-Assertion header and expect to be treated as the
+  // owner, mirroring real local development. The fail-closed-by-default
+  // describe block further down explicitly deletes this to verify the
+  // opposite (and correct-for-production) behavior.
+  process.env.ALLOW_INSECURE_LOCAL_AUTH = 'true';
 
   verifyAccessJwtMock.mockReset();
   verifyAccessJwtMock.mockImplementation(async (token) => {
@@ -289,7 +295,7 @@ describe('multi-user conversation isolation', () => {
     expect(otherMessages[0].content).not.toContain('American Power Systems');
   });
 
-  it('falls back to OWNER_EMAIL as the local-dev identity when the Access header is absent', async () => {
+  it('falls back to OWNER_EMAIL as the local-dev identity when the Access header is absent and ALLOW_INSECURE_LOCAL_AUTH=true', async () => {
     const app = createApp();
     ollamaMock.mockResolvedValueOnce('a reply');
     const res = await request(app).post('/api/chat').send({ prompt: 'no header sent' });
@@ -324,4 +330,39 @@ describe('Access token verification', () => {
     const sentMessages = ollamaMock.mock.calls[0][0];
     expect(sentMessages[0].content).not.toContain('Ben Gillihan');
   });
+
+  it('fails closed (401) on a missing Access header when ALLOW_INSECURE_LOCAL_AUTH is not set', async () => {
+    delete process.env.ALLOW_INSECURE_LOCAL_AUTH;
+    const app = createApp();
+    const res = await request(app).get('/api/conversations');
+    expect(res.status).toBe(401);
+  });
+
+  it('fails closed (401) on a missing Access header when ALLOW_INSECURE_LOCAL_AUTH is set to anything other than "true"', async () => {
+    process.env.ALLOW_INSECURE_LOCAL_AUTH = 'false';
+    const app = createApp();
+    const res = await request(app).get('/api/conversations');
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('rate limiting', () => {
+  it('keys the limiter by verified user identity, not IP, so one user hitting the limit does not block another', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValue('a reply');
+
+    // Exhaust OWNER's 60-request window (all requests in this test share the
+    // same client IP, since supertest talks to an in-process app — this is
+    // exactly the scenario a shared Cloudflare tunnel connection produces in
+    // production, which is what an IP-based key would get wrong).
+    await Promise.all(
+      Array.from({ length: 60 }, (_, i) => asUser(request(app).post('/api/chat'), OWNER).send({ prompt: `msg ${i}` }))
+    );
+
+    const blocked = await asUser(request(app).post('/api/chat'), OWNER).send({ prompt: 'one too many' });
+    expect(blocked.status).toBe(429);
+
+    const otherUserRes = await asUser(request(app).post('/api/chat'), OTHER_USER).send({ prompt: 'hello from titus' });
+    expect(otherUserRes.status).toBe(200);
+  }, 20000);
 });
