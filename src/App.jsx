@@ -4,13 +4,22 @@ import rehypeSanitize from 'rehype-sanitize';
 import { sendMessage, listConversations, getConversation } from './lib/api.js';
 import './App.css';
 
+function ProviderBadge({ provider }) {
+  if (!provider) return null;
+  const label = provider === 'cloud' ? 'Cloud · Gemini' : 'Local · qwen3-church';
+  return <span className={`provider-badge ${provider}`}>{label}</span>;
+}
+
 function Message({ message }) {
   return (
     <div className={`message ${message.role}`}>
       {message.role === 'assistant' ? (
-        <div className="message-text markdown">
-          <ReactMarkdown rehypePlugins={[rehypeSanitize]}>{message.content}</ReactMarkdown>
-        </div>
+        <>
+          <div className="message-text markdown">
+            <ReactMarkdown rehypePlugins={[rehypeSanitize]}>{message.content}</ReactMarkdown>
+          </div>
+          <ProviderBadge provider={message.provider} />
+        </>
       ) : (
         <div className="message-text">{message.content}</div>
       )}
@@ -23,6 +32,7 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
+  const [provider, setProvider] = useState('local');
   const [sending, setSending] = useState(false);
   const historyEndRef = useRef(null);
 
@@ -45,7 +55,7 @@ function App() {
   async function openConversation(id) {
     const priorMessages = await getConversation(id);
     setActiveConversationId(id);
-    setMessages(priorMessages.map((m) => ({ id: m.id, role: m.role, content: m.content })));
+    setMessages(priorMessages.map((m) => ({ id: m.id, role: m.role, content: m.content, provider: m.provider })));
   }
 
   function startNewChat() {
@@ -62,10 +72,13 @@ function App() {
     setSending(true);
 
     try {
-      const response = await sendMessage({ conversationId: activeConversationId, prompt });
+      const response = await sendMessage({ conversationId: activeConversationId, prompt, provider });
       const isNewConversation = !activeConversationId;
       setActiveConversationId(response.conversationId);
-      setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'assistant', content: response.text }]);
+      setMessages((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), role: 'assistant', content: response.text, provider: response.provider }
+      ]);
       if (isNewConversation) refreshConversations();
     } catch (err) {
       setMessages((prev) => [
@@ -113,6 +126,26 @@ function App() {
           <div ref={historyEndRef} />
         </div>
         <div className="chat-input-row">
+          <div className="provider-toggle" role="radiogroup" aria-label="Provider">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={provider === 'local'}
+              className={provider === 'local' ? 'active' : ''}
+              onClick={() => setProvider('local')}
+            >
+              Local
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={provider === 'cloud'}
+              className={provider === 'cloud' ? 'active' : ''}
+              onClick={() => setProvider('cloud')}
+            >
+              Cloud
+            </button>
+          </div>
           <textarea
             value={input}
             onChange={(event) => setInput(event.target.value)}

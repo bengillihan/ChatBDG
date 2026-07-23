@@ -26,6 +26,13 @@ export function initDatabase(path) {
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
   `);
 
+  const hasProviderColumn = db
+    .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'provider'")
+    .get();
+  if (!hasProviderColumn) {
+    db.exec('ALTER TABLE messages ADD COLUMN provider TEXT');
+  }
+
   return db;
 }
 
@@ -57,20 +64,18 @@ export function listConversations() {
 
 export function getMessages(conversationId) {
   return db
-    .prepare('SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC')
+    .prepare(
+      'SELECT id, role, content, provider, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'
+    )
     .all(conversationId);
 }
 
-export function appendMessage(conversationId, role, content) {
+export function appendMessage(conversationId, role, content, provider = null) {
   const id = randomUUID();
   const now = new Date().toISOString();
-  db.prepare('INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)').run(
-    id,
-    conversationId,
-    role,
-    content,
-    now
-  );
+  db.prepare(
+    'INSERT INTO messages (id, conversation_id, role, content, provider, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, conversationId, role, content, provider, now);
 
   const conversation = db.prepare('SELECT title FROM conversations WHERE id = ?').get(conversationId);
   const title = conversation?.title || (role === 'user' ? content.slice(0, 60) : null);

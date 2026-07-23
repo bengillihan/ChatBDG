@@ -13,8 +13,14 @@ import {
   getMessages,
   appendMessage
 } from './db.js';
-import { sendChat, checkOllamaHealth } from './ollamaClient.js';
+import { sendChat as sendOllamaChat, checkOllamaHealth } from './ollamaClient.js';
+import { sendChat as sendGeminiChat, checkGeminiHealth } from './geminiClient.js';
 import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt.js';
+
+const PROVIDERS = {
+  local: { sendChat: sendOllamaChat, label: 'local' },
+  cloud: { sendChat: sendGeminiChat, label: 'cloud' }
+};
 
 validateConfig();
 initDatabase(process.env.DATABASE_PATH);
@@ -35,7 +41,7 @@ const chatLimiter = rateLimit({
 });
 
 app.post('/api/chat', chatLimiter, async (req, res) => {
-  const { conversationId, prompt } = req.body || {};
+  const { conversationId, prompt, provider = 'local' } = req.body || {};
 
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     return res.status(400).json({ error: 'prompt is required' });
@@ -45,6 +51,13 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
   }
   if (conversationId && !conversationExists(conversationId)) {
     return res.status(404).json({ error: 'conversation not found' });
+  }
+  const selectedProvider = PROVIDERS[provider];
+  if (!selectedProvider) {
+    return res.status(400).json({ error: `provider must be one of: ${Object.keys(PROVIDERS).join(', ')}` });
+  }
+  if (provider === 'cloud' && !process.env.GEMINI_API_KEY) {
+    return res.status(400).json({ error: 'GEMINI_API_KEY is not configured — cloud provider is unavailable' });
   }
 
   const activeConversationId = conversationId || createConversation();
@@ -59,11 +72,11 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
   appendMessage(activeConversationId, 'user', prompt);
 
   try {
-    const text = await sendChat(messages);
-    appendMessage(activeConversationId, 'assistant', text);
-    res.json({ conversationId: activeConversationId, text });
+    const text = await selectedProvider.sendChat(messages);
+    appendMessage(activeConversationId, 'assistant', text, selectedProvider.label);
+    res.json({ conversationId: activeConversationId, text, provider: selectedProvider.label });
   } catch (error) {
-    res.status(502).json({ error: `Ollama request failed: ${error.message}` });
+    res.status(502).json({ error: `${selectedProvider.label} provider request failed: ${error.message}` });
   }
 });
 
@@ -80,8 +93,9 @@ app.get('/api/conversations/:id', (req, res) => {
 
 app.get('/api/health', async (req, res) => {
   const [ollama, database] = await Promise.all([checkOllamaHealth(), checkDatabaseHealth()]);
+  const gemini = checkGeminiHealth();
   const allHealthy = ollama === 'healthy' && database === 'healthy';
-  res.json({ status: allHealthy ? 'healthy' : 'degraded', ollama, database });
+  res.json({ status: allHealthy ? 'healthy' : 'degraded', ollama, gemini, database });
 });
 
 app.use(express.static(distDir));

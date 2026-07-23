@@ -7,11 +7,11 @@ async function request(path, options) {
   return data;
 }
 
-export function sendMessage({ conversationId, prompt }) {
+export function sendMessage({ conversationId, prompt, provider }) {
   return request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, prompt })
+    body: JSON.stringify({ conversationId, prompt, provider })
   });
 }
 
