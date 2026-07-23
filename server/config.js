@@ -1,4 +1,11 @@
-const REQUIRED_SETTINGS = ['OLLAMA_BASE_URL', 'OLLAMA_MODEL', 'DATABASE_PATH'];
+const REQUIRED_SETTINGS = [
+  'OLLAMA_BASE_URL',
+  'OLLAMA_MODEL',
+  'DATABASE_PATH',
+  'OWNER_EMAIL',
+  'CF_ACCESS_TEAM_DOMAIN',
+  'CF_ACCESS_AUD'
+];
 
 export function validateConfig(env = process.env) {
   const errors = REQUIRED_SETTINGS.filter((name) => !env[name] || env[name].trim() === '').map(

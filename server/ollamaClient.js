@@ -1,12 +1,16 @@
 import OpenAI from 'openai';
 
+const REQUEST_TIMEOUT_MS = 120_000;
+const MAX_RESPONSE_TOKENS = 4096;
+
 let client;
 
 export function getOllamaClient() {
   if (!client) {
     client = new OpenAI({
       baseURL: process.env.OLLAMA_BASE_URL,
-      apiKey: 'ollama'
+      apiKey: 'ollama',
+      timeout: REQUEST_TIMEOUT_MS
     });
   }
   return client;
@@ -28,7 +32,8 @@ export async function checkOllamaHealth() {
 export async function sendChat(messages) {
   const completion = await getOllamaClient().chat.completions.create({
     model: process.env.OLLAMA_MODEL,
-    messages
+    messages,
+    max_tokens: MAX_RESPONSE_TOKENS
   });
 
   return completion.choices[0].message.content;

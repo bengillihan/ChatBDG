@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
-import { sendMessage, listConversations, getConversation, sanitizeForCloud } from './lib/api.js';
+import {
+  sendMessage,
+  listConversations,
+  getConversation,
+  sanitizeForCloud,
+  getCloudFeedback,
+  incorporateLocally
+} from './lib/api.js';
 import './App.css';
 
 function ProviderBadge({ provider }) {
@@ -10,8 +17,23 @@ function ProviderBadge({ provider }) {
   return <span className={`provider-badge ${provider}`}>{label}</span>;
 }
 
+const LAST_CONVERSATION_KEY = 'chatbdg:lastConversationId';
+
+// The "Incorporate Locally" button's visibility is derived from the
+// conversation's actual message history, not a separate flag kept only in
+// memory — otherwise reopening the conversation (or a page refresh) loses
+// track of an unincorporated cloud-feedback reply even though it's still
+// sitting right there in history.
+function deriveFeedbackFromMessages(messages) {
+  const last = messages[messages.length - 1];
+  if (last && last.role === 'assistant' && last.kind === 'cloud_feedback') {
+    return { messageId: last.id, text: last.content };
+  }
+  return null;
+}
+
 function Message({ message }) {
-  const hasTags = Boolean(message.provider) || Boolean(message.sanitized);
+  const hasTags = Boolean(message.provider) || Boolean(message.sanitized) || Boolean(message.kind);
   return (
     <div className={`message ${message.role}`}>
       {message.role === 'assistant' ? (
@@ -25,6 +47,8 @@ function Message({ message }) {
         <div className="message-tags">
           <ProviderBadge provider={message.provider} />
           {message.sanitized && <span className="sanitized-badge">sanitized</span>}
+          {message.kind === 'cloud_feedback' && <span className="kind-badge feedback">cloud feedback</span>}
+          {message.kind === 'incorporated' && <span className="kind-badge incorporated">incorporated cloud feedback</span>}
         </div>
       )}
     </div>
@@ -37,19 +61,61 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [provider, setProvider] = useState('local');
-  const [sending, setSending] = useState(false);
-  const [sanitizing, setSanitizing] = useState(false);
+  // Single shared in-flight indicator across every network action, so
+  // competing actions (Send to Cloud / Get Cloud Feedback / a plain send)
+  // can't race and double-fire against the same draft.
+  const [busyAction, setBusyAction] = useState(null);
   const [sanitizeDraft, setSanitizeDraft] = useState(null);
   const [sanitizeError, setSanitizeError] = useState(null);
+  const [pendingFeedback, setPendingFeedback] = useState(null);
+  const [pendingCloudConfirm, setPendingCloudConfirm] = useState(null);
   const historyEndRef = useRef(null);
+  const abortControllerRef = useRef(null);
 
   useEffect(() => {
     historyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, sending]);
+  }, [messages, busyAction]);
 
   useEffect(() => {
     refreshConversations();
+    // Restores the same conversation across a real page refresh — without
+    // this, a refresh always dropped back to an empty "new chat" view, which
+    // is how an unincorporated cloud-feedback reply could get lost track of
+    // in practice even after the openConversation()-level fix above. If the
+    // saved ID no longer belongs to this user (e.g. deleted, or a different
+    // person's session on a shared browser), the server 404s and this just
+    // falls back to a fresh chat rather than leaking anything.
+    const savedId = localStorage.getItem(LAST_CONVERSATION_KEY);
+    if (savedId) {
+      openConversation(savedId).catch(() => {
+        localStorage.removeItem(LAST_CONVERSATION_KEY);
+      });
+    }
   }, []);
+
+  useEffect(() => {
+    if (activeConversationId) {
+      localStorage.setItem(LAST_CONVERSATION_KEY, activeConversationId);
+    } else {
+      localStorage.removeItem(LAST_CONVERSATION_KEY);
+    }
+  }, [activeConversationId]);
+
+  function startAction(name) {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setBusyAction(name);
+    return controller.signal;
+  }
+
+  function endAction() {
+    abortControllerRef.current = null;
+    setBusyAction(null);
+  }
+
+  function handleAbort() {
+    abortControllerRef.current?.abort();
+  }
 
   async function refreshConversations() {
     try {
@@ -61,18 +127,21 @@ function App() {
 
   async function openConversation(id) {
     const priorMessages = await getConversation(id);
+    const mapped = priorMessages.map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      provider: m.provider,
+      sanitized: m.sanitized,
+      kind: m.kind
+    }));
     setActiveConversationId(id);
-    setMessages(
-      priorMessages.map((m) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        provider: m.provider,
-        sanitized: m.sanitized
-      }))
-    );
+    setMessages(mapped);
     setSanitizeDraft(null);
     setSanitizeError(null);
+    setPendingFeedback(deriveFeedbackFromMessages(mapped));
+    setPendingCloudConfirm(null);
+    setProvider('local');
   }
 
   function startNewChat() {
@@ -80,76 +149,119 @@ function App() {
     setMessages([]);
     setSanitizeDraft(null);
     setSanitizeError(null);
+    setPendingFeedback(null);
+    setPendingCloudConfirm(null);
+    setProvider('local');
   }
 
-  async function handleSend() {
-    const prompt = input.trim();
-    if (!prompt || sending) return;
-
-    setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', content: prompt }]);
-    setInput('');
-    setSending(true);
+  async function submitMessage(prompt, providerToUse, sanitizedFlag) {
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: 'user', content: prompt, sanitized: sanitizedFlag }
+    ]);
+    const signal = startAction(sanitizedFlag ? 'sendSanitized' : 'send');
 
     try {
-      const response = await sendMessage({ conversationId: activeConversationId, prompt, provider });
+      const response = await sendMessage({
+        conversationId: activeConversationId,
+        prompt,
+        provider: providerToUse,
+        sanitized: sanitizedFlag,
+        signal
+      });
       const isNewConversation = !activeConversationId;
       setActiveConversationId(response.conversationId);
       setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: response.text, provider: response.provider }
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: response.text,
+          provider: response.provider,
+          sanitized: sanitizedFlag
+        }
       ]);
       if (isNewConversation) refreshConversations();
     } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
-      ]);
+      if (err.name !== 'AbortError') {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
+        ]);
+      }
     } finally {
-      setSending(false);
+      endAction();
+      // Cloud is never the ambient default beyond the message that used it —
+      // every send (local or cloud) resets the toggle back to Local.
+      setProvider('local');
     }
   }
 
-  // Always sanitizes the conversation that has actually happened so far
-  // (via conversationId) rather than an unsent draft — this is a review step
-  // over what was already discussed locally, not over what you're about to
-  // type. If nothing has been sent yet, it falls back to sanitizing the
-  // current compose-box text instead so the button still does something
-  // useful on a brand-new chat.
+  function handleSend() {
+    const prompt = input.trim();
+    if (!prompt || busyAction) return;
+    if (provider === 'cloud') {
+      // Don't clear the input yet — if the user cancels the confirmation
+      // below, their draft needs to still be sitting in the compose box.
+      setPendingCloudConfirm(prompt);
+      return;
+    }
+
+    setInput('');
+    submitMessage(prompt, 'local', false);
+  }
+
+  function handleConfirmCloudSend() {
+    if (!pendingCloudConfirm || busyAction) return;
+    const prompt = pendingCloudConfirm;
+    setPendingCloudConfirm(null);
+    setInput('');
+    submitMessage(prompt, 'cloud', false);
+  }
+
+  function handleCancelCloudConfirm() {
+    setPendingCloudConfirm(null);
+  }
+
+  // Requires an existing conversation — sanitizing an unsent draft with no
+  // stored history left "Get Cloud Feedback" with nothing for /api/incorporate
+  // to later restore real names from, so that fallback path is gone.
   async function handleSanitize() {
-    if (sanitizing) return;
+    if (!activeConversationId || busyAction) return;
     setSanitizeError(null);
-    setSanitizing(true);
+    const signal = startAction('sanitize');
     try {
-      const { sanitized } = activeConversationId
-        ? await sanitizeForCloud({ conversationId: activeConversationId })
-        : await sanitizeForCloud({ text: input.trim() });
+      const { sanitized } = await sanitizeForCloud({ conversationId: activeConversationId, signal });
       setSanitizeDraft(sanitized);
     } catch (err) {
-      setSanitizeError(err.message);
+      if (err.name !== 'AbortError') setSanitizeError(err.message);
     } finally {
-      setSanitizing(false);
+      endAction();
     }
   }
 
   function handleCancelSanitize() {
+    abortControllerRef.current?.abort();
     setSanitizeDraft(null);
     setSanitizeError(null);
+    endAction();
   }
 
   async function handleSendSanitized() {
     const prompt = sanitizeDraft.trim();
-    if (!prompt || sending) return;
+    if (!prompt || busyAction) return;
 
     setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', content: prompt, sanitized: true }]);
     setSanitizeDraft(null);
-    setSending(true);
+    const signal = startAction('sendSanitized');
 
     try {
       const response = await sendMessage({
         conversationId: activeConversationId,
         prompt,
         provider: 'cloud',
-        sanitized: true
+        sanitized: true,
+        signal
       });
       const isNewConversation = !activeConversationId;
       setActiveConversationId(response.conversationId);
@@ -165,12 +277,86 @@ function App() {
       ]);
       if (isNewConversation) refreshConversations();
     } catch (err) {
+      if (err.name !== 'AbortError') {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
+        ]);
+      }
+    } finally {
+      endAction();
+    }
+  }
+
+  async function handleGetCloudFeedback() {
+    const text = sanitizeDraft.trim();
+    if (!text || busyAction) return;
+
+    setSanitizeError(null);
+    const signal = startAction('feedback');
+
+    try {
+      const response = await getCloudFeedback({ conversationId: activeConversationId, text, signal });
+      const isNewConversation = !activeConversationId;
+      setActiveConversationId(response.conversationId);
       setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
+        { id: crypto.randomUUID(), role: 'user', content: text, sanitized: true },
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: response.feedback,
+          provider: 'cloud',
+          sanitized: true,
+          kind: 'cloud_feedback'
+        }
       ]);
+      setSanitizeDraft(null);
+      setPendingFeedback({ messageId: response.feedbackMessageId, text: response.feedback });
+      if (isNewConversation) refreshConversations();
+    } catch (err) {
+      if (err.name !== 'AbortError') setSanitizeError(err.message);
     } finally {
-      setSending(false);
+      endAction();
+    }
+  }
+
+  function handleDismissFeedback() {
+    abortControllerRef.current?.abort();
+    setPendingFeedback(null);
+    endAction();
+  }
+
+  async function handleIncorporate() {
+    if (!pendingFeedback || busyAction) return;
+    const signal = startAction('incorporate');
+
+    try {
+      const response = await incorporateLocally({
+        conversationId: activeConversationId,
+        feedbackMessageId: pendingFeedback.messageId,
+        signal
+      });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: response.text,
+          provider: 'local',
+          kind: 'incorporated'
+        }
+      ]);
+      setPendingFeedback(null);
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
+        ]);
+      }
+    } finally {
+      endAction();
     }
   }
 
@@ -181,7 +367,7 @@ function App() {
     }
   }
 
-  const canSanitize = Boolean(activeConversationId) || Boolean(input.trim());
+  const canSanitize = Boolean(activeConversationId);
 
   return (
     <div className="app-shell">
@@ -208,13 +394,21 @@ function App() {
           {messages.map((message) => (
             <Message key={message.id} message={message} />
           ))}
-          {sending && <div className="message assistant pending">Thinking…</div>}
+          {busyAction && (
+            <div className="message assistant pending">
+              Thinking…
+              <button type="button" className="stop-button" onClick={handleAbort}>
+                Stop
+              </button>
+            </div>
+          )}
           <div ref={historyEndRef} />
         </div>
 
         {sanitizeDraft !== null ? (
           <div className="sanitize-panel">
             <div className="sanitize-panel-label">
+              Names have been replaced with numbered placeholders (Person 1, Person 2, etc.) to protect identities.
               Review before sending to the cloud — edit anything the local model missed or got wrong.
             </div>
             <textarea
@@ -229,11 +423,59 @@ function App() {
               </button>
               <button
                 type="button"
+                className="feedback-button"
+                onClick={handleGetCloudFeedback}
+                disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
+              >
+                {busyAction === 'feedback' ? 'Getting feedback…' : 'Get Cloud Feedback'}
+              </button>
+              <button
+                type="button"
                 className="send-to-cloud-button"
                 onClick={handleSendSanitized}
-                disabled={sending || !sanitizeDraft.trim()}
+                disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
               >
-                Send to Cloud
+                {busyAction === 'sendSanitized' ? 'Sending…' : 'Send to Cloud'}
+              </button>
+            </div>
+          </div>
+        ) : pendingCloudConfirm !== null ? (
+          <div className="cloud-confirm-bar">
+            <div className="cloud-confirm-label">
+              This will send your complete conversation history and personal profile to Gemini:
+            </div>
+            <div className="cloud-confirm-preview">{pendingCloudConfirm}</div>
+            <div className="cloud-confirm-actions">
+              <button type="button" className="cancel-button" onClick={handleCancelCloudConfirm}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="send-to-cloud-button"
+                onClick={handleConfirmCloudSend}
+                disabled={Boolean(busyAction)}
+              >
+                {busyAction === 'send' ? 'Sending…' : 'Confirm & Send'}
+              </button>
+            </div>
+          </div>
+        ) : pendingFeedback !== null ? (
+          <div className="incorporate-bar">
+            <div className="incorporate-bar-label">
+              Cloud feedback (Gemini) received — incorporate it into a complete local answer using the real details
+              from this conversation?
+            </div>
+            <div className="incorporate-bar-actions">
+              <button type="button" className="cancel-button" onClick={handleDismissFeedback}>
+                Dismiss
+              </button>
+              <button
+                type="button"
+                className="incorporate-button"
+                onClick={handleIncorporate}
+                disabled={Boolean(busyAction)}
+              >
+                {busyAction === 'incorporate' ? 'Incorporating…' : 'Incorporate Locally'}
               </button>
             </div>
           </div>
@@ -270,12 +512,12 @@ function App() {
               type="button"
               className="sanitize-button"
               onClick={handleSanitize}
-              disabled={sanitizing || !canSanitize}
+              disabled={Boolean(busyAction) || !canSanitize}
               title="Generate a genericized draft of this conversation to review before sending it to the cloud"
             >
-              {sanitizing ? 'Sanitizing…' : 'Sanitize for Cloud'}
+              {busyAction === 'sanitize' ? 'Sanitizing…' : 'Sanitize for Cloud'}
             </button>
-            <button type="button" onClick={handleSend} disabled={sending || !input.trim()}>
+            <button type="button" onClick={handleSend} disabled={Boolean(busyAction) || !input.trim()}>
               Send
             </button>
           </div>

@@ -7,19 +7,39 @@ async function request(path, options) {
   return data;
 }
 
-export function sendMessage({ conversationId, prompt, provider, sanitized }) {
+export function sendMessage({ conversationId, prompt, provider, sanitized, signal }) {
   return request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, prompt, provider, sanitized })
+    body: JSON.stringify({ conversationId, prompt, provider, sanitized }),
+    signal
   });
 }
 
-export function sanitizeForCloud({ conversationId, text }) {
+export function sanitizeForCloud({ conversationId, text, signal }) {
   return request('/api/sanitize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversationId, text })
+    body: JSON.stringify({ conversationId, text }),
+    signal
+  });
+}
+
+export function getCloudFeedback({ conversationId, text, signal }) {
+  return request('/api/cloud-feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, text }),
+    signal
+  });
+}
+
+export function incorporateLocally({ conversationId, feedbackMessageId, signal }) {
+  return request('/api/incorporate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, feedbackMessageId }),
+    signal
   });
 }
 

@@ -17,3 +17,9 @@ Personal context (use only when directly relevant — don't force it into unrela
 // his family, employer, and church, which would re-identify an otherwise
 // sanitized message the moment it reached the cloud provider.
 export const SANITIZED_SYSTEM_PROMPT = `Answer the user's question directly and helpfully, drawing on Reformed theological and general professional knowledge as relevant. The message has been deliberately anonymized before reaching you — do not assume or infer any specific identity, name, employer, or organization for the user.`;
+
+// Appended to the system prompt (not sent as a second system-role message —
+// geminiClient.js only forwards the first one it finds) whenever a
+// conversation's prior turns include a different provider's replies, so the
+// model doesn't inherit or continue the other provider's self-description.
+export const IDENTITY_CONTINUITY_NOTE = `Note: some earlier assistant messages in this conversation may have come from a different AI system than you. Continue the conversation as yourself — do not adopt, repeat, or assume their self-description (e.g. what model or company created them) applies to you.`;
