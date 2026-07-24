@@ -24,10 +24,14 @@ afterEach(() => {
 });
 
 describe('sendChat', () => {
-  it('returns the response text on a normal reply', async () => {
-    generateContentMock.mockResolvedValueOnce({ text: 'a real reply' });
-    const text = await sendChat([{ role: 'user', content: 'hi' }]);
-    expect(text).toBe('a real reply');
+  it('returns the response text and usage on a normal reply', async () => {
+    generateContentMock.mockResolvedValueOnce({
+      text: 'a real reply',
+      usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 34, totalTokenCount: 46 }
+    });
+    const result = await sendChat([{ role: 'user', content: 'hi' }]);
+    expect(result.text).toBe('a real reply');
+    expect(result.usage).toEqual({ promptTokens: 12, completionTokens: 34, totalTokens: 46 });
   });
 
   it('throws a clear error, naming the block reason, when Gemini returns no text (safety block)', async () => {

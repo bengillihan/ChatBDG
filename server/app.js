@@ -3,8 +3,10 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
+import multer from 'multer';
 import { rateLimit } from 'express-rate-limit';
 import { validateConfig } from './config.js';
+import { MAX_ATTACHMENT_BYTES, isAllowedFilename, extractText, wrapAttachment } from './fileExtract.js';
 import {
   initDatabase,
   checkDatabaseHealth,
@@ -36,6 +38,36 @@ const MAX_PROMPT_LENGTH = 8000;
 // gets duplicated if the user retries the same turn.
 function forContext(messages) {
   return messages.filter((m) => m.status !== 'failed' && m.status !== 'pending');
+}
+
+// Memory storage only — the point is text-in-context, not a document store,
+// so the original bytes never touch disk and are discarded once extractText
+// pulls the text out of them. The extension allowlist runs here, in
+// fileFilter, so an unsupported file is rejected before its bytes are ever
+// buffered into memory.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_ATTACHMENT_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (!isAllowedFilename(file.originalname)) {
+      return cb(new Error(`unsupported file type — allowed: .pdf, .docx, .txt, .md`));
+    }
+    cb(null, true);
+  }
+});
+
+// Wraps multer's callback-style error handling so a rejected upload (wrong
+// type, too large) comes back as the same clean JSON 400 shape every other
+// validation error in this app uses, instead of falling through to the
+// centralized 500 handler.
+function handleUpload(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: `file must not exceed ${MAX_ATTACHMENT_BYTES / (1024 * 1024)}MB` });
+    }
+    res.status(400).json({ error: err.message });
+  });
 }
 
 // Cloudflare Access is the entire auth boundary — but the plaintext
@@ -106,14 +138,16 @@ export function createApp() {
     message: { error: 'Too many requests — please slow down' }
   });
 
-  app.post('/api/chat', chatLimiter, async (req, res) => {
-    const { conversationId, prompt, provider = 'local', sanitized } = req.body || {};
-    const sanitizedFlag = sanitized === true;
+  app.post('/api/chat', chatLimiter, handleUpload, async (req, res) => {
+    const requestedAt = new Date().toISOString();
+    const { conversationId, prompt = '', provider = 'local', sanitized } = req.body || {};
+    const sanitizedFlag = sanitized === true || sanitized === 'true';
+    const trimmedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
 
-    if (typeof prompt !== 'string' || prompt.trim() === '') {
+    if (!trimmedPrompt && !req.file) {
       return res.status(400).json({ error: 'prompt is required' });
     }
-    if (prompt.length > MAX_PROMPT_LENGTH) {
+    if (trimmedPrompt.length > MAX_PROMPT_LENGTH) {
       return res.status(400).json({ error: `prompt must not exceed ${MAX_PROMPT_LENGTH} characters` });
     }
     // "Not found" and "not yours" collapse into the same 404 — a user must
@@ -132,8 +166,44 @@ export function createApp() {
     if (sanitizedFlag && provider !== 'cloud') {
       return res.status(400).json({ error: 'the sanitize workflow only applies to the cloud provider' });
     }
+    // Raw file content is never allowed to reach the cloud provider — neither
+    // a file attached to this exact request, nor an earlier raw (unsanitized)
+    // turn already sitting in this conversation's history. The only path a
+    // file's content can take to Gemini is through Sanitize for Cloud, which
+    // rebuilds its own source text from history and doesn't hit this route.
+    if (provider === 'cloud' && req.file) {
+      return res.status(400).json({
+        error: 'file attachments cannot be sent to the cloud provider directly — use Sanitize for Cloud first'
+      });
+    }
+    if (provider === 'cloud' && !sanitizedFlag && conversationId) {
+      const hasRawAttachmentInHistory = forContext(getMessages(conversationId)).some(
+        (m) => m.hasAttachment && !m.sanitized
+      );
+      if (hasRawAttachmentInHistory) {
+        return res.status(400).json({
+          error:
+            'this conversation includes file content that has not been sanitized — use Sanitize for Cloud before sending to the cloud provider'
+        });
+      }
+    }
+
+    let attachment = null;
+    if (req.file) {
+      try {
+        const extracted = await extractText(req.file.buffer, req.file.originalname);
+        attachment = { filename: req.file.originalname, text: wrapAttachment(req.file.originalname, extracted) };
+      } catch (error) {
+        return res.status(400).json({ error: `could not read attached file: ${error.message}` });
+      }
+    }
 
     const activeConversationId = conversationId || createConversation(req.userEmail);
+    const content = attachment
+      ? trimmedPrompt
+        ? `${trimmedPrompt}\n\n${attachment.text}`
+        : attachment.text
+      : trimmedPrompt;
 
     // Sanitized sends are deliberately isolated from this conversation's raw
     // history and from the personal system prompt (which names the owner,
@@ -149,39 +219,44 @@ export function createApp() {
     const messages = [
       { role: 'system', content: systemPrompt },
       ...priorMessages.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user', content: prompt }
+      { role: 'user', content }
     ];
 
-    const { id: userMessageId } = appendMessage(
-      activeConversationId,
-      'user',
-      prompt,
-      null,
-      sanitizedFlag,
-      null,
-      'pending'
-    );
+    const { id: userMessageId } = appendMessage(activeConversationId, 'user', content, {
+      sanitized: sanitizedFlag,
+      status: 'pending',
+      attachment: attachment ? { filename: attachment.filename } : null
+    });
 
     try {
-      const text = await selectedProvider.sendChat(messages);
+      const { text, usage } = await selectedProvider.sendChat(messages);
       updateMessageStatus(userMessageId, 'complete');
-      appendMessage(activeConversationId, 'assistant', text, selectedProvider.label, sanitizedFlag);
+      const { createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', text, {
+        provider: selectedProvider.label,
+        sanitized: sanitizedFlag,
+        usage
+      });
       res.json({
         conversationId: activeConversationId,
         text,
         provider: selectedProvider.label,
-        sanitized: sanitizedFlag
+        sanitized: sanitizedFlag,
+        usage,
+        requestedAt,
+        respondedAt
       });
     } catch (error) {
       updateMessageStatus(userMessageId, 'failed');
       res.status(502).json({
         error: `${selectedProvider.label} provider request failed: ${error.message}`,
-        conversationId: activeConversationId
+        conversationId: activeConversationId,
+        requestedAt
       });
     }
   });
 
   app.post('/api/sanitize', chatLimiter, async (req, res) => {
+    const requestedAt = new Date().toISOString();
     const { conversationId, text } = req.body || {};
     let sourceText;
 
@@ -206,18 +281,22 @@ export function createApp() {
     try {
       // Always local, regardless of the Local/Cloud toggle — this preview
       // step must never itself reach the cloud, and nothing here is
-      // persisted.
-      const sanitizedText = await sendOllamaChat([
+      // persisted. sourceText already carries any attached-file text inline
+      // (it was folded into the stored message content when the file was
+      // sent), so the local model genericizes file content the same way it
+      // genericizes typed conversation text — no separate handling needed.
+      const { text: sanitizedText, usage } = await sendOllamaChat([
         { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
         { role: 'user', content: sourceText }
       ]);
-      res.json({ sanitized: sanitizedText });
+      res.json({ sanitized: sanitizedText, usage, requestedAt, respondedAt: new Date().toISOString() });
     } catch (error) {
-      res.status(502).json({ error: `Sanitization failed: ${error.message}` });
+      res.status(502).json({ error: `Sanitization failed: ${error.message}`, requestedAt });
     }
   });
 
   app.post('/api/cloud-feedback', chatLimiter, async (req, res) => {
+    const requestedAt = new Date().toISOString();
     const { conversationId, text } = req.body || {};
 
     if (typeof text !== 'string' || text.trim() === '') {
@@ -238,33 +317,40 @@ export function createApp() {
     // Same rule as /api/chat's sanitized path: only the already-reviewed
     // text the user explicitly submitted reaches Gemini, isolated from this
     // conversation's raw history.
-    const { id: userMessageId } = appendMessage(activeConversationId, 'user', text, null, true, null, 'pending');
+    const { id: userMessageId } = appendMessage(activeConversationId, 'user', text, { sanitized: true, status: 'pending' });
 
     try {
-      const feedback = await sendGeminiChat([
+      const { text: feedback, usage } = await sendGeminiChat([
         { role: 'system', content: CLOUD_FEEDBACK_SYSTEM_PROMPT },
         { role: 'user', content: text }
       ]);
       updateMessageStatus(userMessageId, 'complete');
-      const { id: feedbackMessageId } = appendMessage(
-        activeConversationId,
-        'assistant',
+      const { id: feedbackMessageId, createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', feedback, {
+        provider: 'cloud',
+        sanitized: true,
+        kind: 'cloud_feedback',
+        usage
+      });
+      res.json({
+        conversationId: activeConversationId,
         feedback,
-        'cloud',
-        true,
-        'cloud_feedback'
-      );
-      res.json({ conversationId: activeConversationId, feedback, feedbackMessageId });
+        feedbackMessageId,
+        usage,
+        requestedAt,
+        respondedAt
+      });
     } catch (error) {
       updateMessageStatus(userMessageId, 'failed');
       res.status(502).json({
         error: `Cloud feedback request failed: ${error.message}`,
-        conversationId: activeConversationId
+        conversationId: activeConversationId,
+        requestedAt
       });
     }
   });
 
   app.post('/api/incorporate', chatLimiter, async (req, res) => {
+    const requestedAt = new Date().toISOString();
     const { conversationId, feedbackMessageId } = req.body || {};
 
     if (!conversationId || !userOwnsConversation(conversationId, req.userEmail)) {
@@ -301,11 +387,15 @@ export function createApp() {
     ];
 
     try {
-      const text = await sendOllamaChat(messages);
-      appendMessage(conversationId, 'assistant', text, 'local', false, 'incorporated');
-      res.json({ conversationId, text });
+      const { text, usage } = await sendOllamaChat(messages);
+      const { createdAt: respondedAt } = appendMessage(conversationId, 'assistant', text, {
+        provider: 'local',
+        kind: 'incorporated',
+        usage
+      });
+      res.json({ conversationId, text, usage, requestedAt, respondedAt });
     } catch (error) {
-      res.status(502).json({ error: `Incorporation failed: ${error.message}` });
+      res.status(502).json({ error: `Incorporation failed: ${error.message}`, requestedAt });
     }
   });
 

@@ -84,7 +84,14 @@ export async function sendChat(messages) {
       );
     }
 
-    return response.text;
+    return {
+      text: response.text,
+      usage: {
+        promptTokens: response.usageMetadata?.promptTokenCount ?? null,
+        completionTokens: response.usageMetadata?.candidatesTokenCount ?? null,
+        totalTokens: response.usageMetadata?.totalTokenCount ?? null
+      }
+    };
   } catch (error) {
     if (isQuotaError(error)) {
       throw new Error('Gemini quota exceeded for this model — check billing/plan on your Google AI Studio project');

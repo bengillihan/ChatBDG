@@ -28,7 +28,12 @@ export function initDatabase(path) {
       kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'incorporated')),
       status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('pending', 'complete', 'failed')),
       seq INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      total_tokens INTEGER,
+      attachment_filename TEXT,
+      has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
@@ -43,7 +48,12 @@ export function initDatabase(path) {
     ['sanitized', 'ALTER TABLE messages ADD COLUMN sanitized INTEGER NOT NULL DEFAULT 0'],
     ['kind', 'ALTER TABLE messages ADD COLUMN kind TEXT'],
     ['status', "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'"],
-    ['seq', 'ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0']
+    ['seq', 'ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0'],
+    ['prompt_tokens', 'ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER'],
+    ['completion_tokens', 'ALTER TABLE messages ADD COLUMN completion_tokens INTEGER'],
+    ['total_tokens', 'ALTER TABLE messages ADD COLUMN total_tokens INTEGER'],
+    ['attachment_filename', 'ALTER TABLE messages ADD COLUMN attachment_filename TEXT'],
+    ['has_attachment', 'ALTER TABLE messages ADD COLUMN has_attachment INTEGER NOT NULL DEFAULT 0']
   ]) {
     const hasColumn = db.prepare(`SELECT 1 FROM pragma_table_info('messages') WHERE name = ?`).get(name);
     if (!hasColumn) {
@@ -112,21 +122,43 @@ export function listConversations(userEmail) {
     .all(userEmail);
 }
 
+const MESSAGE_COLUMNS = `id, conversation_id, role, content, provider, sanitized, kind, status, created_at,
+       prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment`;
+
+// Token usage is only meaningful once a provider actually reports it — a row
+// with all three counts NULL (e.g. a user turn, or a provider that didn't
+// return usage) surfaces as usage: null rather than a block of zeros.
+function formatMessageRow(row) {
+  const hasUsage = row.prompt_tokens != null || row.completion_tokens != null || row.total_tokens != null;
+  return {
+    id: row.id,
+    conversation_id: row.conversation_id,
+    role: row.role,
+    content: row.content,
+    provider: row.provider,
+    sanitized: Boolean(row.sanitized),
+    kind: row.kind,
+    status: row.status,
+    created_at: row.created_at,
+    usage: hasUsage
+      ? { promptTokens: row.prompt_tokens, completionTokens: row.completion_tokens, totalTokens: row.total_tokens }
+      : null,
+    hasAttachment: Boolean(row.has_attachment),
+    attachmentFilename: row.attachment_filename
+  };
+}
+
 export function getMessages(conversationId) {
   return db
-    .prepare(
-      'SELECT id, role, content, provider, sanitized, kind, status, created_at FROM messages WHERE conversation_id = ? ORDER BY seq ASC'
-    )
+    .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? ORDER BY seq ASC`)
     .all(conversationId)
-    .map((m) => ({ ...m, sanitized: Boolean(m.sanitized) }));
+    .map(formatMessageRow);
 }
 
 export function getMessageById(id) {
-  const row = db
-    .prepare('SELECT id, conversation_id, role, content, provider, sanitized, kind, status, created_at FROM messages WHERE id = ?')
-    .get(id);
+  const row = db.prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE id = ?`).get(id);
   if (!row) return null;
-  return { ...row, sanitized: Boolean(row.sanitized) };
+  return formatMessageRow(row);
 }
 
 export function updateMessageStatus(id, status) {
@@ -136,7 +168,8 @@ export function updateMessageStatus(id, status) {
 // DatabaseSync is synchronous and single-writer, so computing the next `seq`
 // and inserting within the same BEGIN/COMMIT is race-free even without a
 // dedicated sequence table — there's no async gap another call could land in.
-export function appendMessage(conversationId, role, content, provider = null, sanitized = false, kind = null, status = 'complete') {
+export function appendMessage(conversationId, role, content, options = {}) {
+  const { provider = null, sanitized = false, kind = null, status = 'complete', usage = null, attachment = null } = options;
   const id = randomUUID();
   const now = new Date().toISOString();
 
@@ -147,8 +180,26 @@ export function appendMessage(conversationId, role, content, provider = null, sa
       .get(conversationId);
 
     db.prepare(
-      'INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(id, conversationId, role, content, provider, sanitized ? 1 : 0, kind, status, seq, now);
+      `INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+                              prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      conversationId,
+      role,
+      content,
+      provider,
+      sanitized ? 1 : 0,
+      kind,
+      status,
+      seq,
+      now,
+      usage?.promptTokens ?? null,
+      usage?.completionTokens ?? null,
+      usage?.totalTokens ?? null,
+      attachment?.filename ?? null,
+      attachment ? 1 : 0
+    );
 
     const conversation = db.prepare('SELECT title FROM conversations WHERE id = ?').get(conversationId);
     const title = conversation?.title || (role === 'user' ? content.slice(0, 60) : null);

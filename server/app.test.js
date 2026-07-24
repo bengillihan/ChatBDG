@@ -88,13 +88,14 @@ afterEach(() => {
 describe('/api/sanitize', () => {
   it('only calls the local (Ollama) client, never Gemini', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a local reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply', usage: null });
     const chatRes = await request(app).post('/api/chat').send({ prompt: 'hello there' });
     expect(chatRes.status).toBe(200);
 
-    ollamaMock.mockResolvedValueOnce(
-      'Note: names have been replaced with numbered placeholders (Person 1, Person 2, etc.) to protect identities. This is a sanitized version of a real conversation.\n\nPerson 1 asked a generic question.'
-    );
+    ollamaMock.mockResolvedValueOnce({
+      text: 'Note: names have been replaced with numbered placeholders (Person 1, Person 2, etc.) to protect identities. This is a sanitized version of a real conversation.\n\nPerson 1 asked a generic question.',
+      usage: null
+    });
     const res = await request(app).post('/api/sanitize').send({ conversationId: chatRes.body.conversationId });
 
     expect(res.status).toBe(200);
@@ -123,11 +124,11 @@ describe('/api/sanitize', () => {
 describe('/api/chat sanitized cloud sends', () => {
   it('sends Gemini no prior conversation content and not the personal system prompt', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a local reply mentioning SECRET_TOKEN_123');
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply mentioning SECRET_TOKEN_123', usage: null });
     const first = await request(app).post('/api/chat').send({ prompt: 'tell me about SECRET_TOKEN_123' });
     const conversationId = first.body.conversationId;
 
-    geminiMock.mockResolvedValueOnce('a cloud reply');
+    geminiMock.mockResolvedValueOnce({ text: 'a cloud reply', usage: null });
     const res = await request(app)
       .post('/api/chat')
       .send({ conversationId, prompt: 'a generic sanitized question', provider: 'cloud', sanitized: true });
@@ -143,7 +144,7 @@ describe('/api/chat sanitized cloud sends', () => {
 
   it('treats a string "false" sanitized flag as false, not true', async () => {
     const app = createApp();
-    geminiMock.mockResolvedValueOnce('a cloud reply');
+    geminiMock.mockResolvedValueOnce({ text: 'a cloud reply', usage: null });
     const res = await request(app)
       .post('/api/chat')
       .send({ prompt: 'hello', provider: 'cloud', sanitized: 'false' });
@@ -156,11 +157,11 @@ describe('/api/chat sanitized cloud sends', () => {
 describe('/api/cloud-feedback', () => {
   it('sends only the given text to Gemini, not conversation history', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a local reply mentioning SECRET_TOKEN_456');
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply mentioning SECRET_TOKEN_456', usage: null });
     const first = await request(app).post('/api/chat').send({ prompt: 'about SECRET_TOKEN_456' });
     const conversationId = first.body.conversationId;
 
-    geminiMock.mockResolvedValueOnce('feedback text');
+    geminiMock.mockResolvedValueOnce({ text: 'feedback text', usage: null });
     const res = await request(app)
       .post('/api/cloud-feedback')
       .send({ conversationId, text: 'Person 1 asked a sanitized question' });
@@ -177,11 +178,11 @@ describe('/api/cloud-feedback', () => {
 describe('/api/incorporate', () => {
   it('only calls the local (Ollama) client, never Gemini', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a local reply about REAL_NAME');
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply about REAL_NAME', usage: null });
     const first = await request(app).post('/api/chat').send({ prompt: 'about REAL_NAME' });
     const conversationId = first.body.conversationId;
 
-    geminiMock.mockResolvedValueOnce('feedback text');
+    geminiMock.mockResolvedValueOnce({ text: 'feedback text', usage: null });
     const feedbackRes = await request(app)
       .post('/api/cloud-feedback')
       .send({ conversationId, text: 'Person 1 sanitized text' });
@@ -189,7 +190,7 @@ describe('/api/incorporate', () => {
 
     geminiMock.mockClear();
     ollamaMock.mockClear();
-    ollamaMock.mockResolvedValueOnce('final answer with REAL_NAME');
+    ollamaMock.mockResolvedValueOnce({ text: 'final answer with REAL_NAME', usage: null });
     const res = await request(app).post('/api/incorporate').send({ conversationId, feedbackMessageId });
 
     expect(res.status).toBe(200);
@@ -199,7 +200,7 @@ describe('/api/incorporate', () => {
 
   it('rejects a feedbackMessageId that does not belong to the conversation', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
     const first = await request(app).post('/api/chat').send({ prompt: 'hi' });
     const conversationId = first.body.conversationId;
 
@@ -218,7 +219,7 @@ describe('provider failure handling', () => {
     const conversationId = failRes.body.conversationId;
     expect(conversationId).toBeTruthy();
 
-    ollamaMock.mockResolvedValueOnce('second attempt reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'second attempt reply', usage: null });
     const okRes = await request(app).post('/api/chat').send({ conversationId, prompt: 'second attempt' });
 
     expect(okRes.status).toBe(200);
@@ -239,7 +240,7 @@ describe('centralized error handling', () => {
 describe('multi-user conversation isolation', () => {
   it('GET /api/conversations only returns the requesting user’s own conversations', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValue('a reply');
+    ollamaMock.mockResolvedValue({ text: 'a reply', usage: null });
 
     await asUser(request(app).post('/api/chat'), OWNER).send({ prompt: 'owner conversation' });
     await asUser(request(app).post('/api/chat'), OTHER_USER).send({ prompt: 'titus conversation' });
@@ -255,7 +256,7 @@ describe('multi-user conversation isolation', () => {
 
   it('GET /api/conversations/:id 404s when a different user requests it', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
     const ownerChat = await asUser(request(app).post('/api/chat'), OWNER).send({ prompt: 'owner-only content' });
     const conversationId = ownerChat.body.conversationId;
 
@@ -268,7 +269,7 @@ describe('multi-user conversation isolation', () => {
 
   it('/api/chat rejects a conversationId belonging to another user', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
     const ownerChat = await asUser(request(app).post('/api/chat'), OWNER).send({ prompt: 'owner-only content' });
     const conversationId = ownerChat.body.conversationId;
 
@@ -282,12 +283,12 @@ describe('multi-user conversation isolation', () => {
   it('gives the owner the personal system prompt and everyone else the shared one', async () => {
     const app = createApp();
 
-    ollamaMock.mockResolvedValueOnce('reply 1');
+    ollamaMock.mockResolvedValueOnce({ text: 'reply 1', usage: null });
     await asUser(request(app).post('/api/chat'), OWNER).send({ prompt: 'hello' });
     const ownerMessages = ollamaMock.mock.calls[0][0];
     expect(ownerMessages[0].content).toContain('Ben Gillihan');
 
-    ollamaMock.mockResolvedValueOnce('reply 2');
+    ollamaMock.mockResolvedValueOnce({ text: 'reply 2', usage: null });
     await asUser(request(app).post('/api/chat'), OTHER_USER).send({ prompt: 'hello' });
     const otherMessages = ollamaMock.mock.calls[1][0];
     expect(otherMessages[0].content).not.toContain('Ben Gillihan');
@@ -297,7 +298,7 @@ describe('multi-user conversation isolation', () => {
 
   it('falls back to OWNER_EMAIL as the local-dev identity when the Access header is absent and ALLOW_INSECURE_LOCAL_AUTH=true', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
     const res = await request(app).post('/api/chat').send({ prompt: 'no header sent' });
     expect(res.status).toBe(200);
 
@@ -316,7 +317,7 @@ describe('Access token verification', () => {
 
   it('a client cannot impersonate the owner by setting the plaintext email header directly', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValueOnce('a reply');
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
 
     // Spoof attempt: claim to be the owner via the old plaintext header,
     // with a real verified token proving the requester is actually Titus.
@@ -346,10 +347,121 @@ describe('Access token verification', () => {
   });
 });
 
+describe('file attachments', () => {
+  it('extracts and attaches text from a plain-text file to a local send, and reports usage/timestamps', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({
+      text: 'a reply about the notes',
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 }
+    });
+
+    const res = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'please review my notes')
+      .attach('file', Buffer.from('SECRET_PERSON details go here'), 'notes.txt');
+
+    expect(res.status).toBe(200);
+    expect(res.body.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+    expect(res.body.requestedAt).toBeTruthy();
+    expect(res.body.respondedAt).toBeTruthy();
+
+    const sentMessages = ollamaMock.mock.calls[0][0];
+    const lastTurn = sentMessages[sentMessages.length - 1];
+    expect(lastTurn.content).toContain('[Attached file: notes.txt]');
+    expect(lastTurn.content).toContain('SECRET_PERSON details go here');
+
+    const history = await request(app).get(`/api/conversations/${res.body.conversationId}`);
+    const userTurn = history.body.find((m) => m.role === 'user');
+    expect(userTurn.hasAttachment).toBe(true);
+    expect(userTurn.attachmentFilename).toBe('notes.txt');
+
+    const assistantTurn = history.body.find((m) => m.role === 'assistant');
+    expect(assistantTurn.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+  });
+
+  it('rejects a disallowed file extension', async () => {
+    const app = createApp();
+    const res = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'hi')
+      .attach('file', Buffer.from('binary junk'), 'malware.exe');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/unsupported file type/);
+    expect(ollamaMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a file over the size limit', async () => {
+    const app = createApp();
+    const oversized = Buffer.alloc(11 * 1024 * 1024, 'a');
+    const res = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'hi')
+      .attach('file', oversized, 'big.txt');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/exceed/);
+  }, 20000);
+
+  it('rejects sending a file attachment directly to the cloud provider', async () => {
+    const app = createApp();
+    const res = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'hi')
+      .field('provider', 'cloud')
+      .attach('file', Buffer.from('some content'), 'notes.txt');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/cannot be sent to the cloud provider directly/);
+    expect(geminiMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a raw cloud send once the conversation history contains an unsanitized attachment', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply about the notes', usage: null });
+
+    const first = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'please review my notes')
+      .attach('file', Buffer.from('SECRET_PERSON details'), 'notes.txt');
+    const conversationId = first.body.conversationId;
+
+    const res = await request(app)
+      .post('/api/chat')
+      .send({ conversationId, prompt: 'now send this to the cloud', provider: 'cloud' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/has not been sanitized/);
+    expect(geminiMock).not.toHaveBeenCalled();
+  });
+
+  it('folds attached-file content into what /api/sanitize sends to the local model for genericization', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a reply about the notes', usage: null });
+
+    const first = await request(app)
+      .post('/api/chat')
+      .field('prompt', 'please review my notes about REAL_NAME_IN_FILE')
+      .attach('file', Buffer.from('REAL_NAME_IN_FILE lives at 123 Main St'), 'notes.txt');
+    const conversationId = first.body.conversationId;
+
+    ollamaMock.mockResolvedValueOnce({
+      text: 'Note: names have been replaced with numbered placeholders (Person 1, Person 2, etc.) to protect identities. This is a sanitized version of a real conversation.\n\nPerson 1 asked about attached notes.',
+      usage: null
+    });
+    const res = await request(app).post('/api/sanitize').send({ conversationId });
+
+    expect(res.status).toBe(200);
+    const sourceTextSent = ollamaMock.mock.calls[1][0][1].content;
+    expect(sourceTextSent).toContain('[Attached file: notes.txt]');
+    expect(sourceTextSent).toContain('REAL_NAME_IN_FILE lives at 123 Main St');
+  });
+});
+
 describe('rate limiting', () => {
   it('keys the limiter by verified user identity, not IP, so one user hitting the limit does not block another', async () => {
     const app = createApp();
-    ollamaMock.mockResolvedValue('a reply');
+    ollamaMock.mockResolvedValue({ text: 'a reply', usage: null });
 
     // Exhaust OWNER's 60-request window (all requests in this test share the
     // same client IP, since supertest talks to an in-process app — this is

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ALLOWED_ATTACHMENT_EXTENSIONS, attachmentError } from './lib/attachments.js';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
 import {
@@ -32,8 +33,22 @@ function deriveFeedbackFromMessages(messages) {
   return null;
 }
 
+function formatTimestamp(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function Message({ message }) {
-  const hasTags = Boolean(message.provider) || Boolean(message.sanitized) || Boolean(message.kind);
+  const hasTags =
+    Boolean(message.provider) ||
+    Boolean(message.sanitized) ||
+    Boolean(message.kind) ||
+    Boolean(message.attachmentFilename) ||
+    Boolean(message.usage?.totalTokens) ||
+    Boolean(message.createdAt);
+  const timestamp = formatTimestamp(message.createdAt);
   return (
     <div className={`message ${message.role}`}>
       {message.role === 'assistant' ? (
@@ -49,6 +64,13 @@ function Message({ message }) {
           {message.sanitized && <span className="sanitized-badge">sanitized</span>}
           {message.kind === 'cloud_feedback' && <span className="kind-badge feedback">cloud feedback</span>}
           {message.kind === 'incorporated' && <span className="kind-badge incorporated">incorporated cloud feedback</span>}
+          {message.attachmentFilename && <span className="attachment-badge">📎 {message.attachmentFilename}</span>}
+          {message.usage?.totalTokens != null && (
+            <span className="token-badge" title="prompt + completion tokens for this turn">
+              {message.usage.totalTokens} tokens
+            </span>
+          )}
+          {timestamp && <span className="timestamp-badge">{timestamp}</span>}
         </div>
       )}
     </div>
@@ -69,8 +91,11 @@ function App() {
   const [sanitizeError, setSanitizeError] = useState(null);
   const [pendingFeedback, setPendingFeedback] = useState(null);
   const [pendingCloudConfirm, setPendingCloudConfirm] = useState(null);
+  const [attachedFile, setAttachedFile] = useState(null);
+  const [attachError, setAttachError] = useState(null);
   const historyEndRef = useRef(null);
   const abortControllerRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     historyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -133,7 +158,10 @@ function App() {
       content: m.content,
       provider: m.provider,
       sanitized: m.sanitized,
-      kind: m.kind
+      kind: m.kind,
+      createdAt: m.created_at,
+      usage: m.usage,
+      attachmentFilename: m.attachmentFilename
     }));
     setActiveConversationId(id);
     setMessages(mapped);
@@ -141,6 +169,8 @@ function App() {
     setSanitizeError(null);
     setPendingFeedback(deriveFeedbackFromMessages(mapped));
     setPendingCloudConfirm(null);
+    setAttachedFile(null);
+    setAttachError(null);
     setProvider('local');
   }
 
@@ -151,13 +181,22 @@ function App() {
     setSanitizeError(null);
     setPendingFeedback(null);
     setPendingCloudConfirm(null);
+    setAttachedFile(null);
+    setAttachError(null);
     setProvider('local');
   }
 
-  async function submitMessage(prompt, providerToUse, sanitizedFlag) {
+  async function submitMessage(prompt, providerToUse, sanitizedFlag, file) {
     setMessages((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), role: 'user', content: prompt, sanitized: sanitizedFlag }
+      {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: prompt,
+        sanitized: sanitizedFlag,
+        attachmentFilename: file?.name,
+        createdAt: new Date().toISOString()
+      }
     ]);
     const signal = startAction(sanitizedFlag ? 'sendSanitized' : 'send');
 
@@ -167,6 +206,7 @@ function App() {
         prompt,
         provider: providerToUse,
         sanitized: sanitizedFlag,
+        file,
         signal
       });
       const isNewConversation = !activeConversationId;
@@ -178,7 +218,9 @@ function App() {
           role: 'assistant',
           content: response.text,
           provider: response.provider,
-          sanitized: sanitizedFlag
+          sanitized: sanitizedFlag,
+          usage: response.usage,
+          createdAt: response.respondedAt
         }
       ]);
       if (isNewConversation) refreshConversations();
@@ -199,16 +241,22 @@ function App() {
 
   function handleSend() {
     const prompt = input.trim();
-    if (!prompt || busyAction) return;
+    if ((!prompt && !attachedFile) || busyAction) return;
     if (provider === 'cloud') {
       // Don't clear the input yet — if the user cancels the confirmation
       // below, their draft needs to still be sitting in the compose box.
+      // Unreachable with a file attached (the Cloud toggle is disabled the
+      // moment a file is attached), but guarded here too since raw file
+      // content must never take the cloud-confirm path.
       setPendingCloudConfirm(prompt);
       return;
     }
 
     setInput('');
-    submitMessage(prompt, 'local', false);
+    const file = attachedFile;
+    setAttachedFile(null);
+    setAttachError(null);
+    submitMessage(prompt, 'local', false, file);
   }
 
   function handleConfirmCloudSend() {
@@ -217,6 +265,29 @@ function App() {
     setPendingCloudConfirm(null);
     setInput('');
     submitMessage(prompt, 'cloud', false);
+  }
+
+  function handleFileSelect(event) {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // allow re-selecting the same file later
+    if (!file) return;
+    const error = attachmentError(file);
+    if (error) {
+      setAttachError(error);
+      setAttachedFile(null);
+      return;
+    }
+    setAttachError(null);
+    setAttachedFile(file);
+    // Raw file content can only ever be sent locally — force the toggle off
+    // Cloud the moment a file is attached, rather than leaving a stale
+    // "Cloud" selection sitting there for handleSend to have to guard against.
+    if (provider === 'cloud') setProvider('local');
+  }
+
+  function handleRemoveAttachment() {
+    setAttachedFile(null);
+    setAttachError(null);
   }
 
   function handleCancelCloudConfirm() {
@@ -251,7 +322,10 @@ function App() {
     const prompt = sanitizeDraft.trim();
     if (!prompt || busyAction) return;
 
-    setMessages((prev) => [...prev, { id: crypto.randomUUID(), role: 'user', content: prompt, sanitized: true }]);
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: 'user', content: prompt, sanitized: true, createdAt: new Date().toISOString() }
+    ]);
     setSanitizeDraft(null);
     const signal = startAction('sendSanitized');
 
@@ -272,7 +346,9 @@ function App() {
           role: 'assistant',
           content: response.text,
           provider: response.provider,
-          sanitized: true
+          sanitized: true,
+          usage: response.usage,
+          createdAt: response.respondedAt
         }
       ]);
       if (isNewConversation) refreshConversations();
@@ -301,14 +377,16 @@ function App() {
       setActiveConversationId(response.conversationId);
       setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'user', content: text, sanitized: true },
+        { id: crypto.randomUUID(), role: 'user', content: text, sanitized: true, createdAt: response.requestedAt },
         {
           id: crypto.randomUUID(),
           role: 'assistant',
           content: response.feedback,
           provider: 'cloud',
           sanitized: true,
-          kind: 'cloud_feedback'
+          kind: 'cloud_feedback',
+          usage: response.usage,
+          createdAt: response.respondedAt
         }
       ]);
       setSanitizeDraft(null);
@@ -344,7 +422,9 @@ function App() {
           role: 'assistant',
           content: response.text,
           provider: 'local',
-          kind: 'incorporated'
+          kind: 'incorporated',
+          usage: response.usage,
+          createdAt: response.respondedAt
         }
       ]);
       setPendingFeedback(null);
@@ -480,46 +560,79 @@ function App() {
             </div>
           </div>
         ) : (
-          <div className="chat-input-row">
-            <div className="provider-toggle" role="radiogroup" aria-label="Provider">
+          <div className="compose-area">
+            {attachedFile && (
+              <div className="attachment-chip">
+                <span>📎 {attachedFile.name}</span>
+                <button type="button" onClick={handleRemoveAttachment} aria-label="Remove attachment">
+                  ×
+                </button>
+              </div>
+            )}
+            {attachError && <div className="attach-error">{attachError}</div>}
+            <div className="chat-input-row">
+              <div className="provider-toggle" role="radiogroup" aria-label="Provider">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={provider === 'local'}
+                  className={provider === 'local' ? 'active' : ''}
+                  onClick={() => setProvider('local')}
+                >
+                  Local
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={provider === 'cloud'}
+                  className={provider === 'cloud' ? 'active' : ''}
+                  onClick={() => setProvider('cloud')}
+                  disabled={Boolean(attachedFile)}
+                  title={attachedFile ? 'Raw file attachments can only be sent locally — use Sanitize for Cloud instead' : undefined}
+                >
+                  Cloud
+                </button>
+              </div>
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask ChatBDG anything..."
+                rows={2}
+              />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ALLOWED_ATTACHMENT_EXTENSIONS.join(',')}
+                onChange={handleFileSelect}
+                className="file-input-hidden"
+              />
               <button
                 type="button"
-                role="radio"
-                aria-checked={provider === 'local'}
-                className={provider === 'local' ? 'active' : ''}
-                onClick={() => setProvider('local')}
+                className="attach-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={Boolean(busyAction)}
+                title="Attach a PDF, Word, text, or markdown file for the local model to read"
               >
-                Local
+                📎 Attach
               </button>
               <button
                 type="button"
-                role="radio"
-                aria-checked={provider === 'cloud'}
-                className={provider === 'cloud' ? 'active' : ''}
-                onClick={() => setProvider('cloud')}
+                className="sanitize-button"
+                onClick={handleSanitize}
+                disabled={Boolean(busyAction) || !canSanitize}
+                title="Generate a genericized draft of this conversation to review before sending it to the cloud"
               >
-                Cloud
+                {busyAction === 'sanitize' ? 'Sanitizing…' : 'Sanitize for Cloud'}
+              </button>
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={Boolean(busyAction) || (!input.trim() && !attachedFile)}
+              >
+                Send
               </button>
             </div>
-            <textarea
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask ChatBDG anything..."
-              rows={2}
-            />
-            <button
-              type="button"
-              className="sanitize-button"
-              onClick={handleSanitize}
-              disabled={Boolean(busyAction) || !canSanitize}
-              title="Generate a genericized draft of this conversation to review before sending it to the cloud"
-            >
-              {busyAction === 'sanitize' ? 'Sanitizing…' : 'Sanitize for Cloud'}
-            </button>
-            <button type="button" onClick={handleSend} disabled={Boolean(busyAction) || !input.trim()}>
-              Send
-            </button>
           </div>
         )}
         {sanitizeError && <div className="sanitize-error">{sanitizeError}</div>}

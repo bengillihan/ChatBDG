@@ -36,5 +36,12 @@ export async function sendChat(messages) {
     max_tokens: MAX_RESPONSE_TOKENS
   });
 
-  return completion.choices[0].message.content;
+  return {
+    text: completion.choices[0].message.content,
+    usage: {
+      promptTokens: completion.usage?.prompt_tokens ?? null,
+      completionTokens: completion.usage?.completion_tokens ?? null,
+      totalTokens: completion.usage?.total_tokens ?? null
+    }
+  };
 }

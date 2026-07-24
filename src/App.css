@@ -175,12 +175,36 @@
   color: #16a34a;
 }
 
+.attachment-badge {
+  background: rgba(148, 163, 184, 0.2);
+  color: #475569;
+}
+
+.token-badge {
+  background: rgba(148, 163, 184, 0.15);
+  color: #64748b;
+  font-weight: 500;
+}
+
+.timestamp-badge {
+  background: transparent;
+  color: var(--text);
+  opacity: 0.6;
+  font-weight: 500;
+  padding: 2px 0;
+}
+
+.compose-area {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
 .chat-input-row {
   display: flex;
   align-items: flex-end;
   gap: 8px;
   padding: 16px 20px;
-  border-top: 1px solid var(--border);
 }
 
 .provider-toggle {
@@ -205,6 +229,54 @@
   background: var(--accent-bg);
   color: var(--text-h);
   font-weight: 600;
+}
+
+.provider-toggle button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.file-input-hidden {
+  display: none;
+}
+
+.attach-button {
+  background: transparent !important;
+  color: #475569 !important;
+  border: 1px dashed rgba(100, 116, 139, 0.5) !important;
+  padding: 0 14px !important;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 20px 0;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(100, 116, 139, 0.4);
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text-h);
+  font-size: 13px;
+  align-self: flex-start;
+}
+
+.attachment-chip button {
+  border: none;
+  background: transparent;
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.attach-error {
+  margin: 8px 20px 0;
+  color: #dc2626;
+  font-size: 13px;
 }
 
 .chat-input-row textarea {

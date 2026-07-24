@@ -7,7 +7,19 @@ async function request(path, options) {
   return data;
 }
 
-export function sendMessage({ conversationId, prompt, provider, sanitized, signal }) {
+export function sendMessage({ conversationId, prompt, provider, sanitized, file, signal }) {
+  if (file) {
+    const formData = new FormData();
+    if (conversationId) formData.append('conversationId', conversationId);
+    formData.append('prompt', prompt || '');
+    formData.append('provider', provider);
+    formData.append('sanitized', String(Boolean(sanitized)));
+    formData.append('file', file);
+    // No Content-Type header here — the browser sets the multipart boundary
+    // itself, which it can only do correctly if it builds the header.
+    return request('/api/chat', { method: 'POST', body: formData, signal });
+  }
+
   return request('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
