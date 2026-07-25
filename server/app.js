@@ -24,6 +24,7 @@ import { DEFAULT_SYSTEM_PROMPT, SANITIZED_SYSTEM_PROMPT, IDENTITY_CONTINUITY_NOT
 import { SHARED_SYSTEM_PROMPT } from './sharedSystemPrompt.js';
 import { SANITIZE_SYSTEM_PROMPT } from './sanitizePrompt.js';
 import { CLOUD_FEEDBACK_SYSTEM_PROMPT } from './cloudFeedbackPrompt.js';
+import { OBJECTIONS_SYSTEM_PROMPT } from './objectionsPrompt.js';
 import { INCORPORATE_SYSTEM_PROMPT } from './incorporatePrompt.js';
 import { verifyAccessJwt } from './cfAccessAuth.js';
 
@@ -295,59 +296,84 @@ export function createApp() {
     }
   });
 
-  app.post('/api/cloud-feedback', chatLimiter, async (req, res) => {
-    const requestedAt = new Date().toISOString();
-    const { conversationId, text } = req.body || {};
+  // Both /api/cloud-feedback and /api/objections take already-reviewed,
+  // sanitized text and send it to Gemini in isolation — never this
+  // conversation's raw history — differing only in which system prompt
+  // steers Gemini's response and which `kind` the reply is tagged with.
+  // /api/incorporate later looks up that `kind` to verify what a given
+  // feedbackMessageId actually is before rebuilding real-name context from it.
+  function registerCloudInputRoute(routePath, { systemPrompt, kind, responseField }) {
+    app.post(routePath, chatLimiter, async (req, res) => {
+      const requestedAt = new Date().toISOString();
+      const { conversationId, text } = req.body || {};
 
-    if (typeof text !== 'string' || text.trim() === '') {
-      return res.status(400).json({ error: 'text is required' });
-    }
-    if (text.length > MAX_PROMPT_LENGTH) {
-      return res.status(400).json({ error: `text must not exceed ${MAX_PROMPT_LENGTH} characters` });
-    }
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(400).json({ error: 'GEMINI_API_KEY is not configured — cloud provider is unavailable' });
-    }
-    if (conversationId && !userOwnsConversation(conversationId, req.userEmail)) {
-      return res.status(404).json({ error: 'conversation not found' });
-    }
+      if (typeof text !== 'string' || text.trim() === '') {
+        return res.status(400).json({ error: 'text is required' });
+      }
+      if (text.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `text must not exceed ${MAX_PROMPT_LENGTH} characters` });
+      }
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(400).json({ error: 'GEMINI_API_KEY is not configured — cloud provider is unavailable' });
+      }
+      if (conversationId && !userOwnsConversation(conversationId, req.userEmail)) {
+        return res.status(404).json({ error: 'conversation not found' });
+      }
 
-    const activeConversationId = conversationId || createConversation(req.userEmail);
+      const activeConversationId = conversationId || createConversation(req.userEmail);
 
-    // Same rule as /api/chat's sanitized path: only the already-reviewed
-    // text the user explicitly submitted reaches Gemini, isolated from this
-    // conversation's raw history.
-    const { id: userMessageId } = appendMessage(activeConversationId, 'user', text, { sanitized: true, status: 'pending' });
+      // Same rule as /api/chat's sanitized path: only the already-reviewed
+      // text the user explicitly submitted reaches Gemini, isolated from this
+      // conversation's raw history.
+      const { id: userMessageId } = appendMessage(activeConversationId, 'user', text, { sanitized: true, status: 'pending' });
 
-    try {
-      const { text: feedback, usage } = await sendGeminiChat([
-        { role: 'system', content: CLOUD_FEEDBACK_SYSTEM_PROMPT },
-        { role: 'user', content: text }
-      ]);
-      updateMessageStatus(userMessageId, 'complete');
-      const { id: feedbackMessageId, createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', feedback, {
-        provider: 'cloud',
-        sanitized: true,
-        kind: 'cloud_feedback',
-        usage
-      });
-      res.json({
-        conversationId: activeConversationId,
-        feedback,
-        feedbackMessageId,
-        usage,
-        requestedAt,
-        respondedAt
-      });
-    } catch (error) {
-      updateMessageStatus(userMessageId, 'failed');
-      res.status(502).json({
-        error: `Cloud feedback request failed: ${error.message}`,
-        conversationId: activeConversationId,
-        requestedAt
-      });
-    }
+      try {
+        const { text: replyText, usage } = await sendGeminiChat([
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: text }
+        ]);
+        updateMessageStatus(userMessageId, 'complete');
+        const { id: feedbackMessageId, createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', replyText, {
+          provider: 'cloud',
+          sanitized: true,
+          kind,
+          usage
+        });
+        res.json({
+          conversationId: activeConversationId,
+          [responseField]: replyText,
+          feedbackMessageId,
+          usage,
+          requestedAt,
+          respondedAt
+        });
+      } catch (error) {
+        updateMessageStatus(userMessageId, 'failed');
+        res.status(502).json({
+          error: `Cloud feedback request failed: ${error.message}`,
+          conversationId: activeConversationId,
+          requestedAt
+        });
+      }
+    });
+  }
+
+  registerCloudInputRoute('/api/cloud-feedback', {
+    systemPrompt: CLOUD_FEEDBACK_SYSTEM_PROMPT,
+    kind: 'cloud_feedback',
+    responseField: 'feedback'
   });
+  registerCloudInputRoute('/api/objections', {
+    systemPrompt: OBJECTIONS_SYSTEM_PROMPT,
+    kind: 'objections',
+    responseField: 'objections'
+  });
+
+  // A feedbackMessageId may point at either a cloud-feedback reply or an
+  // objections reply — both are sanitized Gemini output on the same
+  // conversation, just steered by a different prompt, so incorporation
+  // works identically either way.
+  const INCORPORABLE_KINDS = new Set(['cloud_feedback', 'objections']);
 
   app.post('/api/incorporate', chatLimiter, async (req, res) => {
     const requestedAt = new Date().toISOString();
@@ -361,13 +387,13 @@ export function createApp() {
     }
 
     // Never trust arbitrary client-supplied feedback text — look up the
-    // actual stored message and verify it's really a cloud-feedback reply
-    // belonging to this conversation.
+    // actual stored message and verify it's really a cloud-feedback or
+    // objections reply belonging to this conversation.
     const feedbackMessage = getMessageById(feedbackMessageId);
     if (
       !feedbackMessage ||
       feedbackMessage.conversation_id !== conversationId ||
-      feedbackMessage.kind !== 'cloud_feedback'
+      !INCORPORABLE_KINDS.has(feedbackMessage.kind)
     ) {
       return res.status(404).json({ error: 'feedback message not found for this conversation' });
     }
@@ -377,12 +403,17 @@ export function createApp() {
     // duplicate/contradict the real details this step is meant to restore.
     const originalMessages = forContext(getMessages(conversationId)).filter((m) => !m.sanitized);
 
+    const feedbackLabel =
+      feedbackMessage.kind === 'objections'
+        ? 'Objections raised against a sanitized version of this situation'
+        : 'Outside feedback on a sanitized version of this situation';
+
     const messages = [
       { role: 'system', content: INCORPORATE_SYSTEM_PROMPT },
       ...originalMessages.map((m) => ({ role: m.role, content: m.content })),
       {
         role: 'user',
-        content: `Outside feedback on a sanitized version of this situation:\n\n${feedbackMessage.content}\n\nProduce a final, complete response to the original question above, incorporating the useful parts of this feedback and using the real names and specifics from our conversation.`
+        content: `${feedbackLabel}:\n\n${feedbackMessage.content}\n\nProduce a final, complete response to the original question above, incorporating the useful parts of this feedback and using the real names and specifics from our conversation.`
       }
     ];
 

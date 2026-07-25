@@ -25,7 +25,7 @@ export function initDatabase(path) {
       content TEXT NOT NULL,
       provider TEXT CHECK (provider IS NULL OR provider IN ('local', 'cloud')),
       sanitized INTEGER NOT NULL DEFAULT 0 CHECK (sanitized IN (0, 1)),
-      kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'incorporated')),
+      kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'objections', 'incorporated')),
       status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('pending', 'complete', 'failed')),
       seq INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -38,6 +38,54 @@ export function initDatabase(path) {
 
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
   `);
+
+  // SQLite CHECK constraints are baked into the table's DDL and can't be
+  // altered in place — a database created before 'objections' was a valid
+  // kind still has the old CHECK burned in, so inserting that kind would
+  // fail even though the column already exists. Detected by inspecting the
+  // stored CREATE TABLE text rather than a version flag, so this stays a
+  // no-op forever once the rebuild has happened once.
+  const messagesSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get();
+  if (messagesSchema && !messagesSchema.sql.includes("'objections'")) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        ALTER TABLE messages RENAME TO messages_pre_objections_migration;
+
+        CREATE TABLE messages (
+          id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+          content TEXT NOT NULL,
+          provider TEXT CHECK (provider IS NULL OR provider IN ('local', 'cloud')),
+          sanitized INTEGER NOT NULL DEFAULT 0 CHECK (sanitized IN (0, 1)),
+          kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'objections', 'incorporated')),
+          status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('pending', 'complete', 'failed')),
+          seq INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          prompt_tokens INTEGER,
+          completion_tokens INTEGER,
+          total_tokens INTEGER,
+          attachment_filename TEXT,
+          has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
+        );
+
+        INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+                               prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment)
+          SELECT id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+                 prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment
+          FROM messages_pre_objections_migration;
+
+        DROP TABLE messages_pre_objections_migration;
+
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
+      `);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
 
   // Guarded migrations for databases created before a given column existed —
   // on a brand-new database these are no-ops since CREATE TABLE above already

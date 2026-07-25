@@ -8,6 +8,7 @@ import {
   getConversation,
   sanitizeForCloud,
   getCloudFeedback,
+  getObjections,
   incorporateLocally
 } from './lib/api.js';
 import './App.css';
@@ -23,12 +24,12 @@ const LAST_CONVERSATION_KEY = 'chatbdg:lastConversationId';
 // The "Incorporate Locally" button's visibility is derived from the
 // conversation's actual message history, not a separate flag kept only in
 // memory — otherwise reopening the conversation (or a page refresh) loses
-// track of an unincorporated cloud-feedback reply even though it's still
-// sitting right there in history.
+// track of an unincorporated cloud-feedback/objections reply even though
+// it's still sitting right there in history.
 function deriveFeedbackFromMessages(messages) {
   const last = messages[messages.length - 1];
-  if (last && last.role === 'assistant' && last.kind === 'cloud_feedback') {
-    return { messageId: last.id, text: last.content };
+  if (last && last.role === 'assistant' && (last.kind === 'cloud_feedback' || last.kind === 'objections')) {
+    return { messageId: last.id, text: last.content, kind: last.kind };
   }
   return null;
 }
@@ -63,6 +64,7 @@ function Message({ message }) {
           <ProviderBadge provider={message.provider} />
           {message.sanitized && <span className="sanitized-badge">sanitized</span>}
           {message.kind === 'cloud_feedback' && <span className="kind-badge feedback">cloud feedback</span>}
+          {message.kind === 'objections' && <span className="kind-badge objections">objections</span>}
           {message.kind === 'incorporated' && <span className="kind-badge incorporated">incorporated cloud feedback</span>}
           {message.attachmentFilename && <span className="attachment-badge">📎 {message.attachmentFilename}</span>}
           {message.usage?.totalTokens != null && (
@@ -364,15 +366,18 @@ function App() {
     }
   }
 
-  async function handleGetCloudFeedback() {
+  // Shared by "Get Cloud Feedback" and "Get Objections" — both take the
+  // reviewed sanitize draft, send it to the same cloud-input pipeline, and
+  // differ only in which endpoint/response field/message `kind` is used.
+  async function requestCloudInput({ actionName, apiFn, responseField, kind }) {
     const text = sanitizeDraft.trim();
     if (!text || busyAction) return;
 
     setSanitizeError(null);
-    const signal = startAction('feedback');
+    const signal = startAction(actionName);
 
     try {
-      const response = await getCloudFeedback({ conversationId: activeConversationId, text, signal });
+      const response = await apiFn({ conversationId: activeConversationId, text, signal });
       const isNewConversation = !activeConversationId;
       setActiveConversationId(response.conversationId);
       setMessages((prev) => [
@@ -381,22 +386,30 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: response.feedback,
+          content: response[responseField],
           provider: 'cloud',
           sanitized: true,
-          kind: 'cloud_feedback',
+          kind,
           usage: response.usage,
           createdAt: response.respondedAt
         }
       ]);
       setSanitizeDraft(null);
-      setPendingFeedback({ messageId: response.feedbackMessageId, text: response.feedback });
+      setPendingFeedback({ messageId: response.feedbackMessageId, text: response[responseField], kind });
       if (isNewConversation) refreshConversations();
     } catch (err) {
       if (err.name !== 'AbortError') setSanitizeError(err.message);
     } finally {
       endAction();
     }
+  }
+
+  function handleGetCloudFeedback() {
+    return requestCloudInput({ actionName: 'feedback', apiFn: getCloudFeedback, responseField: 'feedback', kind: 'cloud_feedback' });
+  }
+
+  function handleGetObjections() {
+    return requestCloudInput({ actionName: 'objections', apiFn: getObjections, responseField: 'objections', kind: 'objections' });
   }
 
   function handleDismissFeedback() {
@@ -511,6 +524,14 @@ function App() {
               </button>
               <button
                 type="button"
+                className="objections-button"
+                onClick={handleGetObjections}
+                disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
+              >
+                {busyAction === 'objections' ? 'Getting objections…' : 'Get Objections'}
+              </button>
+              <button
+                type="button"
                 className="send-to-cloud-button"
                 onClick={handleSendSanitized}
                 disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
@@ -542,8 +563,10 @@ function App() {
         ) : pendingFeedback !== null ? (
           <div className="incorporate-bar">
             <div className="incorporate-bar-label">
-              Cloud feedback (Gemini) received — incorporate it into a complete local answer using the real details
-              from this conversation?
+              {pendingFeedback.kind === 'objections'
+                ? 'Objections (Gemini) received'
+                : 'Cloud feedback (Gemini) received'}{' '}
+              — incorporate it into a complete local answer using the real details from this conversation?
             </div>
             <div className="incorporate-bar-actions">
               <button type="button" className="cancel-button" onClick={handleDismissFeedback}>

@@ -175,6 +175,34 @@ describe('/api/cloud-feedback', () => {
   });
 });
 
+describe('/api/objections', () => {
+  it('sends only the given text to Gemini, not conversation history, and tags the reply "objections"', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply mentioning SECRET_TOKEN_789', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'about SECRET_TOKEN_789' });
+    const conversationId = first.body.conversationId;
+
+    geminiMock.mockResolvedValueOnce({ text: '1. First objection\n2. Second objection', usage: null });
+    const res = await request(app)
+      .post('/api/objections')
+      .send({ conversationId, text: 'Person 1 asked a sanitized question' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.objections).toBe('1. First objection\n2. Second objection');
+    expect(geminiMock).toHaveBeenCalledTimes(1);
+    const sentMessages = geminiMock.mock.calls[0][0];
+    const sentText = JSON.stringify(sentMessages);
+    expect(sentText).not.toContain('SECRET_TOKEN_789');
+    expect(sentText).toContain('Person 1');
+
+    const history = await request(app).get(`/api/conversations/${conversationId}`);
+    const objectionsMessage = history.body.find((m) => m.kind === 'objections');
+    expect(objectionsMessage).toBeTruthy();
+    expect(objectionsMessage.provider).toBe('cloud');
+    expect(objectionsMessage.sanitized).toBe(true);
+  });
+});
+
 describe('/api/incorporate', () => {
   it('only calls the local (Ollama) client, never Gemini', async () => {
     const app = createApp();
@@ -198,6 +226,28 @@ describe('/api/incorporate', () => {
     expect(ollamaMock).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts a feedbackMessageId pointing at an objections reply, not just cloud_feedback', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply about REAL_NAME', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'about REAL_NAME' });
+    const conversationId = first.body.conversationId;
+
+    geminiMock.mockResolvedValueOnce({ text: '1. An objection', usage: null });
+    const objectionsRes = await request(app)
+      .post('/api/objections')
+      .send({ conversationId, text: 'Person 1 sanitized text' });
+    const feedbackMessageId = objectionsRes.body.feedbackMessageId;
+
+    ollamaMock.mockResolvedValueOnce({ text: 'final answer addressing the objection, with REAL_NAME', usage: null });
+    const res = await request(app).post('/api/incorporate').send({ conversationId, feedbackMessageId });
+
+    expect(res.status).toBe(200);
+    const sentMessages = ollamaMock.mock.calls[ollamaMock.mock.calls.length - 1][0];
+    const sentText = JSON.stringify(sentMessages);
+    expect(sentText).toContain('REAL_NAME');
+    expect(sentText).toContain('An objection');
+  });
+
   it('rejects a feedbackMessageId that does not belong to the conversation', async () => {
     const app = createApp();
     ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
@@ -205,6 +255,19 @@ describe('/api/incorporate', () => {
     const conversationId = first.body.conversationId;
 
     const res = await request(app).post('/api/incorporate').send({ conversationId, feedbackMessageId: 'not-a-real-id' });
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects a feedbackMessageId pointing at a message that is neither cloud_feedback nor objections', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a plain local reply', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'hi' });
+    const conversationId = first.body.conversationId;
+
+    const history = await request(app).get(`/api/conversations/${conversationId}`);
+    const plainMessageId = history.body.find((m) => m.role === 'assistant').id;
+
+    const res = await request(app).post('/api/incorporate').send({ conversationId, feedbackMessageId: plainMessageId });
     expect(res.status).toBe(404);
   });
 });
@@ -225,6 +288,36 @@ describe('provider failure handling', () => {
     expect(okRes.status).toBe(200);
     const sentMessages = ollamaMock.mock.calls[1][0];
     expect(JSON.stringify(sentMessages)).not.toContain('first attempt that fails');
+  });
+});
+
+describe('/api/chat conversation continuity', () => {
+  it('sends every completed prior turn to Ollama unchanged and instructs it to handle revisions incrementally', async () => {
+    const app = createApp();
+    const originalDraft = `ORIGINAL_DRAFT_START\n${'original communion draft paragraph '.repeat(210)}\nNot earned — given\nORIGINAL_DRAFT_END`;
+    const firstFeedback = `FIRST_FEEDBACK_START\n${'specific feedback on the original draft '.repeat(130)}\nFIRST_FEEDBACK_END`;
+    const revisedDraft = `REVISED_DRAFT_START\n${'original communion draft paragraph '.repeat(210)}\nNot earned — traded\nREVISED_DRAFT_END`;
+
+    ollamaMock.mockResolvedValueOnce({ text: firstFeedback, usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: originalDraft });
+    expect(first.status).toBe(200);
+
+    ollamaMock.mockResolvedValueOnce({ text: 'targeted revision feedback', usage: null });
+    const second = await request(app)
+      .post('/api/chat')
+      .send({ conversationId: first.body.conversationId, prompt: revisedDraft });
+    expect(second.status).toBe(200);
+
+    const sentMessages = ollamaMock.mock.calls[1][0];
+    expect(sentMessages).toEqual([
+      expect.objectContaining({
+        role: 'system',
+        content: expect.stringContaining('explicitly acknowledge it as a revision')
+      }),
+      { role: 'user', content: originalDraft },
+      { role: 'assistant', content: firstFeedback },
+      { role: 'user', content: revisedDraft }
+    ]);
   });
 });
 

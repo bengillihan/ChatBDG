@@ -46,6 +46,15 @@ export function getCloudFeedback({ conversationId, text, signal }) {
   });
 }
 
+export function getObjections({ conversationId, text, signal }) {
+  return request('/api/objections', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, text }),
+    signal
+  });
+}
+
 export function incorporateLocally({ conversationId, feedbackMessageId, signal }) {
   return request('/api/incorporate', {
     method: 'POST',
