@@ -170,9 +170,19 @@
   color: #4f46e5;
 }
 
+.kind-badge.pros-cons {
+  background: rgba(14, 165, 233, 0.15);
+  color: #0369a1;
+}
+
 .kind-badge.objections {
   background: rgba(220, 38, 38, 0.15);
   color: #b91c1c;
+}
+
+.kind-badge.improvements {
+  background: rgba(168, 85, 247, 0.15);
+  color: #7e22ce;
 }
 
 .kind-badge.incorporated {
@@ -345,6 +355,7 @@
 
 .sanitize-panel-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
@@ -384,6 +395,17 @@
   cursor: default;
 }
 
+.pros-cons-button {
+  border: 1px solid rgba(14, 165, 233, 0.5);
+  background: rgba(14, 165, 233, 0.1);
+  color: #0369a1;
+}
+
+.pros-cons-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .objections-button {
   border: 1px solid rgba(220, 38, 38, 0.5);
   background: rgba(220, 38, 38, 0.1);
@@ -391,6 +413,17 @@
 }
 
 .objections-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.improvements-button {
+  border: 1px solid rgba(168, 85, 247, 0.5);
+  background: rgba(168, 85, 247, 0.1);
+  color: #7e22ce;
+}
+
+.improvements-button:disabled {
   opacity: 0.5;
   cursor: default;
 }
@@ -433,6 +466,12 @@
   border: none;
   background: #16a34a;
   color: #fff;
+}
+
+.organize-button {
+  border: 1px solid rgba(22, 163, 74, 0.5);
+  background: rgba(22, 163, 74, 0.08);
+  color: #15803d;
 }
 
 .incorporate-button:hover:not(:disabled) {

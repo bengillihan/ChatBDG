@@ -203,6 +203,49 @@ describe('/api/objections', () => {
   });
 });
 
+describe('purpose-built cloud feedback variants', () => {
+  it('uses four distinct Gemini prompts, isolates real history, and persists a distinct kind for each response', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'local reply mentioning FABRICATED_REAL_NAME', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'about FABRICATED_REAL_NAME' });
+    const conversationId = first.body.conversationId;
+    const variants = [
+      { path: '/api/cloud-feedback', field: 'feedback', kind: 'cloud_feedback', reply: 'open-ended analysis' },
+      { path: '/api/pros-cons', field: 'prosCons', kind: 'pros_cons', reply: 'Pros: clear. Cons: thin.' },
+      { path: '/api/objections', field: 'objections', kind: 'objections', reply: '1. A counterargument' },
+      { path: '/api/improvements', field: 'improvements', kind: 'improvements', reply: '1. Add a concrete example' }
+    ];
+
+    for (const variant of variants) {
+      geminiMock.mockResolvedValueOnce({ text: variant.reply, usage: null });
+      const res = await request(app)
+        .post(variant.path)
+        .send({ conversationId, text: 'Person 1 recommends a measured transition for Person 2.' });
+      expect(res.status).toBe(200);
+      expect(res.body[variant.field]).toBe(variant.reply);
+      expect(res.body.feedbackMessageId).toBeTruthy();
+    }
+
+    const promptTexts = geminiMock.mock.calls.map(([messages]) => messages[0].content);
+    expect(new Set(promptTexts).size).toBe(4);
+    expect(promptTexts.join('\n')).not.toContain('FABRICATED_REAL_NAME');
+    expect(promptTexts[1]).toMatch(/balanced assessment/i);
+    expect(promptTexts[2]).toMatch(/stress-test/i);
+    expect(promptTexts[3]).toMatch(/actionable improvement/i);
+
+    for (const [messages] of geminiMock.mock.calls) {
+      expect(messages).toHaveLength(2);
+      expect(messages[1].content).toContain('Person 1');
+      expect(JSON.stringify(messages)).not.toContain('FABRICATED_REAL_NAME');
+    }
+
+    const history = await request(app).get(`/api/conversations/${conversationId}`);
+    expect(
+      history.body.filter((message) => message.role === 'assistant' && message.provider === 'cloud').map((message) => message.kind)
+    ).toEqual(variants.map((variant) => variant.kind));
+  });
+});
+
 describe('/api/incorporate', () => {
   it('only calls the local (Ollama) client, never Gemini', async () => {
     const app = createApp();
@@ -248,6 +291,99 @@ describe('/api/incorporate', () => {
     expect(sentText).toContain('An objection');
   });
 
+  it('uses the local model and restores real-name context after every feedback variant', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'Initial advice for Miriam Solace and Jonah Vale', usage: null });
+    const first = await request(app)
+      .post('/api/chat')
+      .send({ prompt: 'Help Miriam Solace prepare a recommendation for Jonah Vale.' });
+    const conversationId = first.body.conversationId;
+    const variants = [
+      { path: '/api/cloud-feedback', kind: 'cloud_feedback', reply: 'General feedback about Person 1 and Person 2' },
+      { path: '/api/pros-cons', kind: 'pros_cons', reply: 'Pros and cons for Person 1 and Person 2' },
+      { path: '/api/objections', kind: 'objections', reply: 'Objections concerning Person 1 and Person 2' },
+      { path: '/api/improvements', kind: 'improvements', reply: 'Improvements for Person 1 and Person 2' }
+    ];
+
+    for (const variant of variants) {
+      geminiMock.mockResolvedValueOnce({ text: variant.reply, usage: null });
+      const feedback = await request(app)
+        .post(variant.path)
+        .send({ conversationId, text: 'Person 1 is preparing a recommendation for Person 2.' });
+
+      geminiMock.mockClear();
+      ollamaMock.mockClear();
+      ollamaMock.mockResolvedValueOnce({
+        text: `Final recommendation naming Miriam Solace and Jonah Vale after ${variant.kind}`,
+        usage: null
+      });
+      const incorporated = await request(app)
+        .post('/api/incorporate')
+        .send({ conversationId, feedbackMessageId: feedback.body.feedbackMessageId, mode: 'incorporate' });
+
+      expect(incorporated.status).toBe(200);
+      expect(incorporated.body.feedbackKind).toBe(variant.kind);
+      expect(incorporated.body.incorporationMode).toBe('incorporate');
+      expect(geminiMock).not.toHaveBeenCalled();
+      expect(ollamaMock).toHaveBeenCalledTimes(1);
+      const sentText = JSON.stringify(ollamaMock.mock.calls[0][0]);
+      expect(sentText).toContain('Miriam Solace');
+      expect(sentText).toContain('Jonah Vale');
+      expect(sentText).toContain(variant.reply);
+    }
+
+    const history = await request(app).get(`/api/conversations/${conversationId}`);
+    const incorporatedMessages = history.body.filter((message) => message.kind === 'incorporated');
+    expect(incorporatedMessages).toHaveLength(4);
+    expect(incorporatedMessages.map((message) => message.feedbackKind)).toEqual(variants.map((variant) => variant.kind));
+    expect(incorporatedMessages.every((message) => message.incorporationMode === 'incorporate')).toBe(true);
+    expect(incorporatedMessages.every((message) => Boolean(message.feedbackMessageId))).toBe(true);
+  });
+
+  it('supports Organize Feedback as a distinct local mode and records its provenance', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'Initial answer about Miriam Solace', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'Advise Miriam Solace.' });
+    const conversationId = first.body.conversationId;
+
+    geminiMock.mockResolvedValueOnce({ text: 'Pros and cons about Person 1', usage: null });
+    const feedback = await request(app)
+      .post('/api/pros-cons')
+      .send({ conversationId, text: 'Person 1 is considering a change.' });
+
+    geminiMock.mockClear();
+    ollamaMock.mockClear();
+    ollamaMock.mockResolvedValueOnce({ text: 'Adopt / Consider / Reject for Miriam Solace', usage: null });
+    const organized = await request(app)
+      .post('/api/incorporate')
+      .send({ conversationId, feedbackMessageId: feedback.body.feedbackMessageId, mode: 'organize' });
+
+    expect(organized.status).toBe(200);
+    expect(organized.body.incorporationMode).toBe('organize');
+    expect(organized.body.feedbackKind).toBe('pros_cons');
+    expect(geminiMock).not.toHaveBeenCalled();
+    const sentMessages = ollamaMock.mock.calls[0][0];
+    expect(sentMessages[0].content).toMatch(/Adopt.*Consider.*Reject/s);
+    expect(JSON.stringify(sentMessages)).toContain('Miriam Solace');
+
+    const history = await request(app).get(`/api/conversations/${conversationId}`);
+    const organizedMessage = history.body.find(
+      (message) => message.kind === 'incorporated' && message.incorporationMode === 'organize'
+    );
+    expect(organizedMessage.feedbackMessageId).toBe(feedback.body.feedbackMessageId);
+    expect(organizedMessage.feedbackKind).toBe('pros_cons');
+  });
+
+  it('rejects an unknown incorporation mode', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'initial reply', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'hello' });
+    const res = await request(app)
+      .post('/api/incorporate')
+      .send({ conversationId: first.body.conversationId, feedbackMessageId: 'anything', mode: 'unknown' });
+    expect(res.status).toBe(400);
+  });
+
   it('rejects a feedbackMessageId that does not belong to the conversation', async () => {
     const app = createApp();
     ollamaMock.mockResolvedValueOnce({ text: 'a reply', usage: null });
@@ -258,7 +394,7 @@ describe('/api/incorporate', () => {
     expect(res.status).toBe(404);
   });
 
-  it('rejects a feedbackMessageId pointing at a message that is neither cloud_feedback nor objections', async () => {
+  it('rejects a feedbackMessageId pointing at a message that is not a recognized feedback variant', async () => {
     const app = createApp();
     ollamaMock.mockResolvedValueOnce({ text: 'a plain local reply', usage: null });
     const first = await request(app).post('/api/chat').send({ prompt: 'hi' });

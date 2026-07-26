@@ -24,13 +24,53 @@ import { DEFAULT_SYSTEM_PROMPT, SANITIZED_SYSTEM_PROMPT, IDENTITY_CONTINUITY_NOT
 import { SHARED_SYSTEM_PROMPT } from './sharedSystemPrompt.js';
 import { SANITIZE_SYSTEM_PROMPT } from './sanitizePrompt.js';
 import { CLOUD_FEEDBACK_SYSTEM_PROMPT } from './cloudFeedbackPrompt.js';
+import { PROS_CONS_SYSTEM_PROMPT } from './prosConsPrompt.js';
 import { OBJECTIONS_SYSTEM_PROMPT } from './objectionsPrompt.js';
-import { INCORPORATE_SYSTEM_PROMPT } from './incorporatePrompt.js';
+import { IMPROVEMENT_SYSTEM_PROMPT } from './improvementPrompt.js';
+import { INCORPORATE_SYSTEM_PROMPT, ORGANIZE_FEEDBACK_SYSTEM_PROMPT } from './incorporatePrompt.js';
 import { verifyAccessJwt } from './cfAccessAuth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '../dist');
 const MAX_PROMPT_LENGTH = 8000;
+
+// Cloudflare's edge gives up waiting on an idle origin connection after
+// ~100-125s (a 524), a limit that isn't user-adjustable outside an Enterprise
+// plan — and a 32k-context local-model call can legitimately run past that.
+// Writing an insignificant whitespace byte to the response periodically
+// while the provider call is in flight keeps the connection non-idle, so
+// Cloudflare never considers it stalled, no matter how long generation
+// takes. JSON.parse (and so the frontend's `response.json()`) silently skips
+// leading whitespace, so the eventual real payload still parses as-is — the
+// response contract is unchanged for every request fast enough that no
+// heartbeat byte ever gets written (which is every request in this test
+// suite, and the overwhelming majority in production).
+//
+// The one thing that DOES change once a heartbeat byte has gone out: the
+// status code is locked in at whatever it was at that moment (200, since we
+// never set it early), so a failure discovered only after a heartbeat has
+// already fired is reported as `{ error }` in a 200 body instead of a 502.
+// finishJson()/withHeartbeat() below handle that fallback; the frontend's
+// request() helper treats a truthy `error` field as a failure regardless of
+// status code.
+const HEARTBEAT_INTERVAL_MS = 15_000;
+
+function withHeartbeat(res, work) {
+  res.type('json');
+  const timer = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) res.write(' ');
+  }, HEARTBEAT_INTERVAL_MS);
+  res.once('close', () => clearInterval(timer));
+  return work().finally(() => clearInterval(timer));
+}
+
+function finishJson(res, statusCode, payload) {
+  if (res.headersSent) {
+    res.end(JSON.stringify(payload));
+  } else {
+    res.status(statusCode).json(payload);
+  }
+}
 
 // Only rows that completed successfully belong in a rebuilt LLM context —
 // a 'pending' row means the provider call is still in flight (shouldn't be
@@ -230,14 +270,14 @@ export function createApp() {
     });
 
     try {
-      const { text, usage } = await selectedProvider.sendChat(messages);
+      const { text, usage } = await withHeartbeat(res, () => selectedProvider.sendChat(messages));
       updateMessageStatus(userMessageId, 'complete');
       const { createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', text, {
         provider: selectedProvider.label,
         sanitized: sanitizedFlag,
         usage
       });
-      res.json({
+      finishJson(res, 200, {
         conversationId: activeConversationId,
         text,
         provider: selectedProvider.label,
@@ -248,7 +288,7 @@ export function createApp() {
       });
     } catch (error) {
       updateMessageStatus(userMessageId, 'failed');
-      res.status(502).json({
+      finishJson(res, 502, {
         error: `${selectedProvider.label} provider request failed: ${error.message}`,
         conversationId: activeConversationId,
         requestedAt
@@ -286,20 +326,21 @@ export function createApp() {
       // (it was folded into the stored message content when the file was
       // sent), so the local model genericizes file content the same way it
       // genericizes typed conversation text — no separate handling needed.
-      const { text: sanitizedText, usage } = await sendOllamaChat([
-        { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
-        { role: 'user', content: sourceText }
-      ]);
-      res.json({ sanitized: sanitizedText, usage, requestedAt, respondedAt: new Date().toISOString() });
+      const { text: sanitizedText, usage } = await withHeartbeat(res, () =>
+        sendOllamaChat([
+          { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
+          { role: 'user', content: sourceText }
+        ])
+      );
+      finishJson(res, 200, { sanitized: sanitizedText, usage, requestedAt, respondedAt: new Date().toISOString() });
     } catch (error) {
-      res.status(502).json({ error: `Sanitization failed: ${error.message}`, requestedAt });
+      finishJson(res, 502, { error: `Sanitization failed: ${error.message}`, requestedAt });
     }
   });
 
-  // Both /api/cloud-feedback and /api/objections take already-reviewed,
-  // sanitized text and send it to Gemini in isolation — never this
-  // conversation's raw history — differing only in which system prompt
-  // steers Gemini's response and which `kind` the reply is tagged with.
+  // Every purpose-built feedback route takes already-reviewed sanitized text
+  // and sends it to Gemini in isolation — never this conversation's raw
+  // history — differing only in the prompt, response field, and history tag.
   // /api/incorporate later looks up that `kind` to verify what a given
   // feedbackMessageId actually is before rebuilding real-name context from it.
   function registerCloudInputRoute(routePath, { systemPrompt, kind, responseField }) {
@@ -363,21 +404,34 @@ export function createApp() {
     kind: 'cloud_feedback',
     responseField: 'feedback'
   });
+  registerCloudInputRoute('/api/pros-cons', {
+    systemPrompt: PROS_CONS_SYSTEM_PROMPT,
+    kind: 'pros_cons',
+    responseField: 'prosCons'
+  });
   registerCloudInputRoute('/api/objections', {
     systemPrompt: OBJECTIONS_SYSTEM_PROMPT,
     kind: 'objections',
     responseField: 'objections'
   });
+  registerCloudInputRoute('/api/improvements', {
+    systemPrompt: IMPROVEMENT_SYSTEM_PROMPT,
+    kind: 'improvements',
+    responseField: 'improvements'
+  });
 
-  // A feedbackMessageId may point at either a cloud-feedback reply or an
-  // objections reply — both are sanitized Gemini output on the same
-  // conversation, just steered by a different prompt, so incorporation
-  // works identically either way.
-  const INCORPORABLE_KINDS = new Set(['cloud_feedback', 'objections']);
+  const FEEDBACK_LABELS = {
+    cloud_feedback: 'Open-ended feedback on a sanitized version of this situation',
+    pros_cons: 'Pros and cons of a sanitized version of this situation',
+    objections: 'Objections raised against a sanitized version of this situation',
+    improvements: 'Improvement suggestions for a sanitized version of this situation'
+  };
+  const INCORPORABLE_KINDS = new Set(Object.keys(FEEDBACK_LABELS));
+  const INCORPORATION_MODES = new Set(['incorporate', 'organize']);
 
   app.post('/api/incorporate', chatLimiter, async (req, res) => {
     const requestedAt = new Date().toISOString();
-    const { conversationId, feedbackMessageId } = req.body || {};
+    const { conversationId, feedbackMessageId, mode = 'incorporate' } = req.body || {};
 
     if (!conversationId || !userOwnsConversation(conversationId, req.userEmail)) {
       return res.status(404).json({ error: 'conversation not found' });
@@ -385,10 +439,13 @@ export function createApp() {
     if (typeof feedbackMessageId !== 'string' || feedbackMessageId.trim() === '') {
       return res.status(400).json({ error: 'feedbackMessageId is required' });
     }
+    if (!INCORPORATION_MODES.has(mode)) {
+      return res.status(400).json({ error: 'mode must be one of: incorporate, organize' });
+    }
 
     // Never trust arbitrary client-supplied feedback text — look up the
-    // actual stored message and verify it's really a cloud-feedback or
-    // objections reply belonging to this conversation.
+    // actual stored message and verify it is a recognized feedback-variant
+    // reply belonging to this conversation.
     const feedbackMessage = getMessageById(feedbackMessageId);
     if (
       !feedbackMessage ||
@@ -403,30 +460,44 @@ export function createApp() {
     // duplicate/contradict the real details this step is meant to restore.
     const originalMessages = forContext(getMessages(conversationId)).filter((m) => !m.sanitized);
 
-    const feedbackLabel =
-      feedbackMessage.kind === 'objections'
-        ? 'Objections raised against a sanitized version of this situation'
-        : 'Outside feedback on a sanitized version of this situation';
+    const feedbackLabel = FEEDBACK_LABELS[feedbackMessage.kind];
+    const organize = mode === 'organize';
+    const systemPrompt = organize ? ORGANIZE_FEEDBACK_SYSTEM_PROMPT : INCORPORATE_SYSTEM_PROMPT;
+    const finalInstruction = organize
+      ? 'Organize this feedback using the real names and specifics from our conversation. Do not rewrite the original answer.'
+      : 'Produce a final, complete response to the original question above, incorporating the useful parts of this feedback and using the real names and specifics from our conversation.';
 
     const messages = [
-      { role: 'system', content: INCORPORATE_SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       ...originalMessages.map((m) => ({ role: m.role, content: m.content })),
       {
         role: 'user',
-        content: `${feedbackLabel}:\n\n${feedbackMessage.content}\n\nProduce a final, complete response to the original question above, incorporating the useful parts of this feedback and using the real names and specifics from our conversation.`
+        content: `${feedbackLabel}:\n\n${feedbackMessage.content}\n\n${finalInstruction}`
       }
     ];
 
     try {
-      const { text, usage } = await sendOllamaChat(messages);
+      const { text, usage } = await withHeartbeat(res, () => sendOllamaChat(messages));
       const { createdAt: respondedAt } = appendMessage(conversationId, 'assistant', text, {
         provider: 'local',
         kind: 'incorporated',
+        feedbackMessageId,
+        feedbackKind: feedbackMessage.kind,
+        incorporationMode: mode,
         usage
       });
-      res.json({ conversationId, text, usage, requestedAt, respondedAt });
+      finishJson(res, 200, {
+        conversationId,
+        text,
+        feedbackMessageId,
+        feedbackKind: feedbackMessage.kind,
+        incorporationMode: mode,
+        usage,
+        requestedAt,
+        respondedAt
+      });
     } catch (error) {
-      res.status(502).json({ error: `Incorporation failed: ${error.message}`, requestedAt });
+      finishJson(res, 502, { error: `Incorporation failed: ${error.message}`, requestedAt });
     }
   });
 

@@ -25,7 +25,10 @@ export function initDatabase(path) {
       content TEXT NOT NULL,
       provider TEXT CHECK (provider IS NULL OR provider IN ('local', 'cloud')),
       sanitized INTEGER NOT NULL DEFAULT 0 CHECK (sanitized IN (0, 1)),
-      kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'objections', 'incorporated')),
+      kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'pros_cons', 'objections', 'improvements', 'incorporated')),
+      feedback_message_id TEXT,
+      feedback_kind TEXT CHECK (feedback_kind IS NULL OR feedback_kind IN ('cloud_feedback', 'pros_cons', 'objections', 'improvements')),
+      incorporation_mode TEXT CHECK (incorporation_mode IS NULL OR incorporation_mode IN ('incorporate', 'organize')),
       status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('pending', 'complete', 'failed')),
       seq INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -40,17 +43,17 @@ export function initDatabase(path) {
   `);
 
   // SQLite CHECK constraints are baked into the table's DDL and can't be
-  // altered in place — a database created before 'objections' was a valid
-  // kind still has the old CHECK burned in, so inserting that kind would
-  // fail even though the column already exists. Detected by inspecting the
-  // stored CREATE TABLE text rather than a version flag, so this stays a
-  // no-op forever once the rebuild has happened once.
+  // altered in place. Rebuild once when adding the purpose-built feedback
+  // kinds, and add the incorporation provenance columns at the same time.
+  // Inspecting the stored DDL makes this idempotent without a schema-version
+  // table and also upgrades databases that already received the earlier
+  // objections-only rebuild.
   const messagesSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get();
-  if (messagesSchema && !messagesSchema.sql.includes("'objections'")) {
+  if (messagesSchema && !messagesSchema.sql.includes("'pros_cons'")) {
     db.exec('BEGIN');
     try {
       db.exec(`
-        ALTER TABLE messages RENAME TO messages_pre_objections_migration;
+        ALTER TABLE messages RENAME TO messages_pre_feedback_variants_migration;
 
         CREATE TABLE messages (
           id TEXT PRIMARY KEY,
@@ -59,7 +62,10 @@ export function initDatabase(path) {
           content TEXT NOT NULL,
           provider TEXT CHECK (provider IS NULL OR provider IN ('local', 'cloud')),
           sanitized INTEGER NOT NULL DEFAULT 0 CHECK (sanitized IN (0, 1)),
-          kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'objections', 'incorporated')),
+          kind TEXT CHECK (kind IS NULL OR kind IN ('cloud_feedback', 'pros_cons', 'objections', 'improvements', 'incorporated')),
+          feedback_message_id TEXT,
+          feedback_kind TEXT CHECK (feedback_kind IS NULL OR feedback_kind IN ('cloud_feedback', 'pros_cons', 'objections', 'improvements')),
+          incorporation_mode TEXT CHECK (incorporation_mode IS NULL OR incorporation_mode IN ('incorporate', 'organize')),
           status TEXT NOT NULL DEFAULT 'complete' CHECK (status IN ('pending', 'complete', 'failed')),
           seq INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
@@ -70,13 +76,15 @@ export function initDatabase(path) {
           has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
         );
 
-        INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+        INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind,
+                               feedback_message_id, feedback_kind, incorporation_mode, status, seq, created_at,
                                prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment)
-          SELECT id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+          SELECT id, conversation_id, role, content, provider, sanitized, kind,
+                 NULL, NULL, NULL, status, seq, created_at,
                  prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment
-          FROM messages_pre_objections_migration;
+          FROM messages_pre_feedback_variants_migration;
 
-        DROP TABLE messages_pre_objections_migration;
+        DROP TABLE messages_pre_feedback_variants_migration;
 
         CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
       `);
@@ -95,6 +103,9 @@ export function initDatabase(path) {
     ['provider', 'ALTER TABLE messages ADD COLUMN provider TEXT'],
     ['sanitized', 'ALTER TABLE messages ADD COLUMN sanitized INTEGER NOT NULL DEFAULT 0'],
     ['kind', 'ALTER TABLE messages ADD COLUMN kind TEXT'],
+    ['feedback_message_id', 'ALTER TABLE messages ADD COLUMN feedback_message_id TEXT'],
+    ['feedback_kind', 'ALTER TABLE messages ADD COLUMN feedback_kind TEXT'],
+    ['incorporation_mode', 'ALTER TABLE messages ADD COLUMN incorporation_mode TEXT'],
     ['status', "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'"],
     ['seq', 'ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0'],
     ['prompt_tokens', 'ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER'],
@@ -170,7 +181,8 @@ export function listConversations(userEmail) {
     .all(userEmail);
 }
 
-const MESSAGE_COLUMNS = `id, conversation_id, role, content, provider, sanitized, kind, status, created_at,
+const MESSAGE_COLUMNS = `id, conversation_id, role, content, provider, sanitized, kind,
+       feedback_message_id, feedback_kind, incorporation_mode, status, created_at,
        prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment`;
 
 // Token usage is only meaningful once a provider actually reports it — a row
@@ -186,6 +198,9 @@ function formatMessageRow(row) {
     provider: row.provider,
     sanitized: Boolean(row.sanitized),
     kind: row.kind,
+    feedbackMessageId: row.feedback_message_id,
+    feedbackKind: row.feedback_kind,
+    incorporationMode: row.incorporation_mode,
     status: row.status,
     created_at: row.created_at,
     usage: hasUsage
@@ -217,7 +232,17 @@ export function updateMessageStatus(id, status) {
 // and inserting within the same BEGIN/COMMIT is race-free even without a
 // dedicated sequence table — there's no async gap another call could land in.
 export function appendMessage(conversationId, role, content, options = {}) {
-  const { provider = null, sanitized = false, kind = null, status = 'complete', usage = null, attachment = null } = options;
+  const {
+    provider = null,
+    sanitized = false,
+    kind = null,
+    feedbackMessageId = null,
+    feedbackKind = null,
+    incorporationMode = null,
+    status = 'complete',
+    usage = null,
+    attachment = null
+  } = options;
   const id = randomUUID();
   const now = new Date().toISOString();
 
@@ -228,9 +253,10 @@ export function appendMessage(conversationId, role, content, options = {}) {
       .get(conversationId);
 
     db.prepare(
-      `INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind, status, seq, created_at,
+      `INSERT INTO messages (id, conversation_id, role, content, provider, sanitized, kind,
+                              feedback_message_id, feedback_kind, incorporation_mode, status, seq, created_at,
                               prompt_tokens, completion_tokens, total_tokens, attachment_filename, has_attachment)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       conversationId,
@@ -239,6 +265,9 @@ export function appendMessage(conversationId, role, content, options = {}) {
       provider,
       sanitized ? 1 : 0,
       kind,
+      feedbackMessageId,
+      feedbackKind,
+      incorporationMode,
       status,
       seq,
       now,

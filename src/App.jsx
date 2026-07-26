@@ -8,7 +8,9 @@ import {
   getConversation,
   sanitizeForCloud,
   getCloudFeedback,
+  getProsCons,
   getObjections,
+  getImprovements,
   incorporateLocally
 } from './lib/api.js';
 import './App.css';
@@ -21,15 +23,64 @@ function ProviderBadge({ provider }) {
 
 const LAST_CONVERSATION_KEY = 'chatbdg:lastConversationId';
 
-// The "Incorporate Locally" button's visibility is derived from the
-// conversation's actual message history, not a separate flag kept only in
-// memory — otherwise reopening the conversation (or a page refresh) loses
-// track of an unincorporated cloud-feedback/objections reply even though
-// it's still sitting right there in history.
-function deriveFeedbackFromMessages(messages) {
-  const last = messages[messages.length - 1];
-  if (last && last.role === 'assistant' && (last.kind === 'cloud_feedback' || last.kind === 'objections')) {
-    return { messageId: last.id, text: last.content, kind: last.kind };
+export const FEEDBACK_VARIANTS = [
+  {
+    actionName: 'feedback',
+    label: 'General Feedback',
+    pendingLabel: 'Getting feedback…',
+    apiFn: getCloudFeedback,
+    responseField: 'feedback',
+    kind: 'cloud_feedback',
+    className: 'feedback-button'
+  },
+  {
+    actionName: 'prosCons',
+    label: 'Pros & Cons',
+    pendingLabel: 'Weighing pros & cons…',
+    apiFn: getProsCons,
+    responseField: 'prosCons',
+    kind: 'pros_cons',
+    className: 'pros-cons-button'
+  },
+  {
+    actionName: 'objections',
+    label: 'Objections',
+    pendingLabel: 'Getting objections…',
+    apiFn: getObjections,
+    responseField: 'objections',
+    kind: 'objections',
+    className: 'objections-button'
+  },
+  {
+    actionName: 'improvements',
+    label: 'How to Improve',
+    pendingLabel: 'Finding improvements…',
+    apiFn: getImprovements,
+    responseField: 'improvements',
+    kind: 'improvements',
+    className: 'improvements-button'
+  }
+];
+
+const FEEDBACK_LABELS = Object.fromEntries(FEEDBACK_VARIANTS.map((variant) => [variant.kind, variant.label]));
+const FEEDBACK_KINDS = new Set(FEEDBACK_VARIANTS.map((variant) => variant.kind));
+
+// Find the newest feedback reply that has not already been consumed by an
+// incorporation action. This deliberately does not require feedback to be
+// the very last message: a later plain message or page refresh must not make
+// the explicit button disappear. Legacy incorporated rows lack a source ID,
+// so treat one as a boundary rather than resurfacing older feedback.
+export function deriveFeedbackFromMessages(messages) {
+  const consumedIds = new Set(
+    messages.filter((message) => message.kind === 'incorporated' && message.feedbackMessageId).map((message) => message.feedbackMessageId)
+  );
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.kind === 'incorporated' && !message.feedbackMessageId) break;
+    if (message.role === 'assistant' && FEEDBACK_KINDS.has(message.kind) && !consumedIds.has(message.id)) {
+      return { messageId: message.id, text: message.content, kind: message.kind };
+    }
   }
   return null;
 }
@@ -64,8 +115,15 @@ function Message({ message }) {
           <ProviderBadge provider={message.provider} />
           {message.sanitized && <span className="sanitized-badge">sanitized</span>}
           {message.kind === 'cloud_feedback' && <span className="kind-badge feedback">cloud feedback</span>}
+          {message.kind === 'pros_cons' && <span className="kind-badge pros-cons">pros &amp; cons</span>}
           {message.kind === 'objections' && <span className="kind-badge objections">objections</span>}
-          {message.kind === 'incorporated' && <span className="kind-badge incorporated">incorporated cloud feedback</span>}
+          {message.kind === 'improvements' && <span className="kind-badge improvements">how to improve</span>}
+          {message.kind === 'incorporated' && (
+            <span className="kind-badge incorporated">
+              {message.incorporationMode === 'organize' ? 'organized' : 'incorporated'}
+              {message.feedbackKind ? ` · ${FEEDBACK_LABELS[message.feedbackKind] || message.feedbackKind}` : ' cloud feedback'}
+            </span>
+          )}
           {message.attachmentFilename && <span className="attachment-badge">📎 {message.attachmentFilename}</span>}
           {message.usage?.totalTokens != null && (
             <span className="token-badge" title="prompt + completion tokens for this turn">
@@ -161,6 +219,9 @@ function App() {
       provider: m.provider,
       sanitized: m.sanitized,
       kind: m.kind,
+      feedbackMessageId: m.feedbackMessageId,
+      feedbackKind: m.feedbackKind,
+      incorporationMode: m.incorporationMode,
       createdAt: m.created_at,
       usage: m.usage,
       attachmentFilename: m.attachmentFilename
@@ -366,10 +427,10 @@ function App() {
     }
   }
 
-  // Shared by "Get Cloud Feedback" and "Get Objections" — both take the
-  // reviewed sanitize draft, send it to the same cloud-input pipeline, and
-  // differ only in which endpoint/response field/message `kind` is used.
-  async function requestCloudInput({ actionName, apiFn, responseField, kind }) {
+  // All feedback variants share the reviewed sanitize draft and confirmation
+  // boundary. Only the Gemini prompt, response field, and history kind differ.
+  async function requestCloudInput(variant) {
+    const { actionName, apiFn, responseField, kind } = variant;
     const text = sanitizeDraft.trim();
     if (!text || busyAction) return;
 
@@ -404,28 +465,22 @@ function App() {
     }
   }
 
-  function handleGetCloudFeedback() {
-    return requestCloudInput({ actionName: 'feedback', apiFn: getCloudFeedback, responseField: 'feedback', kind: 'cloud_feedback' });
-  }
-
-  function handleGetObjections() {
-    return requestCloudInput({ actionName: 'objections', apiFn: getObjections, responseField: 'objections', kind: 'objections' });
-  }
-
   function handleDismissFeedback() {
     abortControllerRef.current?.abort();
     setPendingFeedback(null);
     endAction();
   }
 
-  async function handleIncorporate() {
+  async function handleIncorporate(mode = 'incorporate') {
     if (!pendingFeedback || busyAction) return;
-    const signal = startAction('incorporate');
+    const actionName = mode === 'organize' ? 'organize' : 'incorporate';
+    const signal = startAction(actionName);
 
     try {
       const response = await incorporateLocally({
         conversationId: activeConversationId,
         feedbackMessageId: pendingFeedback.messageId,
+        mode,
         signal
       });
       setMessages((prev) => [
@@ -436,6 +491,9 @@ function App() {
           content: response.text,
           provider: 'local',
           kind: 'incorporated',
+          feedbackMessageId: response.feedbackMessageId,
+          feedbackKind: response.feedbackKind,
+          incorporationMode: response.incorporationMode,
           usage: response.usage,
           createdAt: response.respondedAt
         }
@@ -514,22 +572,17 @@ function App() {
               <button type="button" className="cancel-button" onClick={handleCancelSanitize}>
                 Cancel
               </button>
-              <button
-                type="button"
-                className="feedback-button"
-                onClick={handleGetCloudFeedback}
-                disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
-              >
-                {busyAction === 'feedback' ? 'Getting feedback…' : 'Get Cloud Feedback'}
-              </button>
-              <button
-                type="button"
-                className="objections-button"
-                onClick={handleGetObjections}
-                disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
-              >
-                {busyAction === 'objections' ? 'Getting objections…' : 'Get Objections'}
-              </button>
+              {FEEDBACK_VARIANTS.map((variant) => (
+                <button
+                  key={variant.kind}
+                  type="button"
+                  className={variant.className}
+                  onClick={() => requestCloudInput(variant)}
+                  disabled={Boolean(busyAction) || !sanitizeDraft.trim()}
+                >
+                  {busyAction === variant.actionName ? variant.pendingLabel : variant.label}
+                </button>
+              ))}
               <button
                 type="button"
                 className="send-to-cloud-button"
@@ -563,9 +616,7 @@ function App() {
         ) : pendingFeedback !== null ? (
           <div className="incorporate-bar">
             <div className="incorporate-bar-label">
-              {pendingFeedback.kind === 'objections'
-                ? 'Objections (Gemini) received'
-                : 'Cloud feedback (Gemini) received'}{' '}
+              {FEEDBACK_LABELS[pendingFeedback.kind] || 'Cloud feedback'} (Gemini) received{' '}
               — incorporate it into a complete local answer using the real details from this conversation?
             </div>
             <div className="incorporate-bar-actions">
@@ -574,8 +625,16 @@ function App() {
               </button>
               <button
                 type="button"
+                className="organize-button"
+                onClick={() => handleIncorporate('organize')}
+                disabled={Boolean(busyAction)}
+              >
+                {busyAction === 'organize' ? 'Organizing…' : 'Organize Feedback'}
+              </button>
+              <button
+                type="button"
                 className="incorporate-button"
-                onClick={handleIncorporate}
+                onClick={() => handleIncorporate('incorporate')}
                 disabled={Boolean(busyAction)}
               >
                 {busyAction === 'incorporate' ? 'Incorporating…' : 'Incorporate Locally'}
