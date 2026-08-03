@@ -103,6 +103,22 @@ describe('/api/sanitize', () => {
     expect(geminiMock).not.toHaveBeenCalled();
   });
 
+  it('locally removes names and email addresses missed by the model before returning the preview', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({
+      text: 'Note: this is sanitized. Miriam Solace can email miriam@example.org.',
+      usage: null
+    });
+
+    const res = await request(app).post('/api/sanitize').send({
+      text: 'From: Miriam Solace <miriam@example.org>\nPlease advise Miriam.'
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.sanitized).not.toMatch(/Miriam|Solace|miriam@example\.org/i);
+    expect(geminiMock).not.toHaveBeenCalled();
+  });
+
   it('fails cleanly against a conversation with no messages', async () => {
     const app = createApp();
     const conversationId = createConversation(OWNER);
@@ -142,6 +158,27 @@ describe('/api/chat sanitized cloud sends', () => {
     expect(sentMessages).toHaveLength(2); // system prompt + this one user turn only
   });
 
+  it('redacts names reintroduced into a reviewed draft before calling Gemini', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'local reply', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'Help Miriam Solace prepare a response.' });
+
+    geminiMock.mockResolvedValueOnce({ text: 'cloud reply', usage: null });
+    const res = await request(app)
+      .post('/api/chat')
+      .send({
+        conversationId: first.body.conversationId,
+        prompt: 'Miriam Solace should respond carefully.',
+        provider: 'cloud',
+        sanitized: true
+      });
+
+    expect(res.status).toBe(200);
+    const sentText = JSON.stringify(geminiMock.mock.calls[0][0]);
+    expect(sentText).not.toContain('Miriam');
+    expect(sentText).not.toContain('Solace');
+  });
+
   it('treats a string "false" sanitized flag as false, not true', async () => {
     const app = createApp();
     geminiMock.mockResolvedValueOnce({ text: 'a cloud reply', usage: null });
@@ -172,6 +209,24 @@ describe('/api/cloud-feedback', () => {
     const sentText = JSON.stringify(sentMessages);
     expect(sentText).not.toContain('SECRET_TOKEN_456');
     expect(sentText).toContain('Person 1');
+  });
+
+  it('redacts names and email addresses at the cloud boundary', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'local reply', usage: null });
+    const first = await request(app).post('/api/chat').send({
+      prompt: 'From: Miriam Solace <miriam@example.org>\nMiriam asked Jonah Vale for advice.'
+    });
+
+    geminiMock.mockResolvedValueOnce({ text: 'feedback', usage: null });
+    const res = await request(app).post('/api/cloud-feedback').send({
+      conversationId: first.body.conversationId,
+      text: 'Miriam asked Jonah Vale to email miriam@example.org.'
+    });
+
+    expect(res.status).toBe(200);
+    const sentText = JSON.stringify(geminiMock.mock.calls[0][0]);
+    for (const secret of ['Miriam', 'Jonah', 'Vale', 'miriam@example.org']) expect(sentText).not.toContain(secret);
   });
 });
 

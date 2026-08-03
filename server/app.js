@@ -23,6 +23,7 @@ import { sendChat as sendGeminiChat, checkGeminiHealth } from './geminiClient.js
 import { DEFAULT_SYSTEM_PROMPT, SANITIZED_SYSTEM_PROMPT, IDENTITY_CONTINUITY_NOTE } from './systemPrompt.js';
 import { SHARED_SYSTEM_PROMPT } from './sharedSystemPrompt.js';
 import { SANITIZE_SYSTEM_PROMPT } from './sanitizePrompt.js';
+import { sanitizeCloudText } from './privacySanitizer.js';
 import { CLOUD_FEEDBACK_SYSTEM_PROMPT } from './cloudFeedbackPrompt.js';
 import { PROS_CONS_SYSTEM_PROMPT } from './prosConsPrompt.js';
 import { OBJECTIONS_SYSTEM_PROMPT } from './objectionsPrompt.js';
@@ -240,11 +241,19 @@ export function createApp() {
     }
 
     const activeConversationId = conversationId || createConversation(req.userEmail);
-    const content = attachment
+    let content = attachment
       ? trimmedPrompt
         ? `${trimmedPrompt}\n\n${attachment.text}`
         : attachment.text
       : trimmedPrompt;
+
+    // A client flag is not a privacy boundary. Re-sanitize locally at the
+    // last possible moment, using the original conversation as reference, so
+    // names reintroduced while editing the preview cannot reach Gemini.
+    if (provider === 'cloud' && sanitizedFlag) {
+      const referenceText = forContext(getMessages(activeConversationId)).map((m) => m.content).join('\n');
+      content = sanitizeCloudText(content, referenceText);
+    }
 
     // Sanitized sends are deliberately isolated from this conversation's raw
     // history and from the personal system prompt (which names the owner,
@@ -326,12 +335,15 @@ export function createApp() {
       // (it was folded into the stored message content when the file was
       // sent), so the local model genericizes file content the same way it
       // genericizes typed conversation text — no separate handling needed.
-      const { text: sanitizedText, usage } = await withHeartbeat(res, () =>
+      const { text: modelSanitizedText, usage } = await withHeartbeat(res, () =>
         sendOllamaChat([
           { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
           { role: 'user', content: sourceText }
         ])
       );
+      // The local model supplies the nuanced rewrite; this deterministic
+      // second pass removes names it may have missed before previewing.
+      const sanitizedText = sanitizeCloudText(modelSanitizedText, sourceText);
       finishJson(res, 200, { sanitized: sanitizedText, usage, requestedAt, respondedAt: new Date().toISOString() });
     } catch (error) {
       finishJson(res, 502, { error: `Sanitization failed: ${error.message}`, requestedAt });
@@ -362,16 +374,20 @@ export function createApp() {
       }
 
       const activeConversationId = conversationId || createConversation(req.userEmail);
+      const referenceText = conversationId
+        ? forContext(getMessages(conversationId)).map((m) => m.content).join('\n')
+        : '';
+      const cloudSafeText = sanitizeCloudText(text.trim(), referenceText);
 
       // Same rule as /api/chat's sanitized path: only the already-reviewed
       // text the user explicitly submitted reaches Gemini, isolated from this
       // conversation's raw history.
-      const { id: userMessageId } = appendMessage(activeConversationId, 'user', text, { sanitized: true, status: 'pending' });
+      const { id: userMessageId } = appendMessage(activeConversationId, 'user', cloudSafeText, { sanitized: true, status: 'pending' });
 
       try {
         const { text: replyText, usage } = await sendGeminiChat([
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: text }
+          { role: 'user', content: cloudSafeText }
         ]);
         updateMessageStatus(userMessageId, 'complete');
         const { id: feedbackMessageId, createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', replyText, {
