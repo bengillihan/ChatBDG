@@ -762,3 +762,96 @@ describe('rate limiting', () => {
     expect(otherUserRes.status).toBe(200);
   }, 20000);
 });
+
+// Parses an SSE body into its `data:` events, ignoring heartbeat comments.
+function parseEvents(text) {
+  return text
+    .split('\n\n')
+    .map((block) => block.split('\n').find((line) => line.startsWith('data: ')))
+    .filter(Boolean)
+    .map((line) => JSON.parse(line.slice('data: '.length)));
+}
+
+describe('streamed responses', () => {
+  it('streams local deltas as SSE and finishes with the same payload a JSON response would carry', async () => {
+    const app = createApp();
+    ollamaMock.mockImplementationOnce(async (messages, { onDelta, onThinking }) => {
+      onThinking();
+      onDelta('Hello');
+      onDelta(' world');
+      return { text: 'Hello world', usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } };
+    });
+
+    const res = await request(app).post('/api/chat').send({ prompt: 'hi', stream: true });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/event-stream/);
+    const events = parseEvents(res.text);
+    expect(events.map((e) => e.type)).toEqual(['thinking', 'delta', 'delta', 'done']);
+    const done = events.at(-1);
+    expect(done).toMatchObject({ text: 'Hello world', provider: 'local' });
+
+    const history = await request(app).get(`/api/conversations/${done.conversationId}`);
+    expect(history.body.map((m) => [m.role, m.content, m.status])).toEqual([
+      ['user', 'hi', 'complete'],
+      ['assistant', 'Hello world', 'complete']
+    ]);
+  });
+
+  it('reports a provider failure as an error event and marks the user turn failed', async () => {
+    const app = createApp();
+    ollamaMock.mockRejectedValueOnce(new Error('model crashed'));
+
+    const res = await request(app).post('/api/chat').send({ prompt: 'hi', stream: true });
+
+    const events = parseEvents(res.text);
+    expect(events.at(-1)).toMatchObject({ type: 'error' });
+    expect(events.at(-1).error).toMatch(/model crashed/);
+    const history = await request(app).get(`/api/conversations/${events.at(-1).conversationId}`);
+    expect(history.body.map((m) => m.status)).toEqual(['failed']);
+  });
+
+  it('forwards the think flag to the local client, defaulting to off', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValue({ text: 'reply', usage: null });
+
+    await request(app).post('/api/chat').send({ prompt: 'quick one' });
+    await request(app).post('/api/chat').send({ prompt: 'deep one', think: true });
+
+    expect(ollamaMock.mock.calls[0][1].think).toBe(false);
+    expect(ollamaMock.mock.calls[1][1].think).toBe(true);
+  });
+
+  it('keeps thinking on for the privacy-critical sanitize rewrite', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply', usage: null });
+    const chatRes = await request(app).post('/api/chat').send({ prompt: 'hello there' });
+
+    ollamaMock.mockResolvedValueOnce({ text: 'Note: sanitized.\n\nPerson 1 asked something.', usage: null });
+    await request(app).post('/api/sanitize').send({ conversationId: chatRes.body.conversationId });
+
+    expect(ollamaMock.mock.calls[1][1]).toMatchObject({ think: true });
+  });
+
+  it('streams incorporation without ever calling Gemini', async () => {
+    const app = createApp();
+    ollamaMock.mockResolvedValueOnce({ text: 'a local reply about REAL_NAME', usage: null });
+    const first = await request(app).post('/api/chat').send({ prompt: 'about REAL_NAME' });
+    const conversationId = first.body.conversationId;
+    geminiMock.mockResolvedValueOnce({ text: 'feedback text', usage: null });
+    const feedbackRes = await request(app).post('/api/cloud-feedback').send({ conversationId, text: 'Person 1 text' });
+
+    geminiMock.mockClear();
+    ollamaMock.mockImplementationOnce(async (messages, { onDelta }) => {
+      onDelta('final answer');
+      return { text: 'final answer with REAL_NAME', usage: null };
+    });
+    const res = await request(app)
+      .post('/api/incorporate')
+      .send({ conversationId, feedbackMessageId: feedbackRes.body.feedbackMessageId, stream: true });
+
+    const events = parseEvents(res.text);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'final answer with REAL_NAME' });
+    expect(geminiMock).not.toHaveBeenCalled();
+  });
+});

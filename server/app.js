@@ -73,6 +73,77 @@ function finishJson(res, statusCode, payload) {
   }
 }
 
+// Server-sent events framing for streamed replies. text/event-stream (plus
+// no-transform, so Cloudflare won't compress-and-buffer it) is the content
+// type Cloudflare's edge reliably passes through chunk by chunk. The
+// heartbeat is an SSE comment line, which every SSE parser ignores — still
+// needed because a cold model load plus prompt processing can go well past
+// Cloudflare's idle timeout before the first token exists.
+function openEventStream(res) {
+  res.status(200).set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  const timer = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) res.write(': keep-alive\n\n');
+  }, HEARTBEAT_INTERVAL_MS);
+  res.once('close', () => clearInterval(timer));
+  const send = (event) => {
+    if (!res.writableEnded && !res.destroyed) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  return {
+    send,
+    end(event) {
+      clearInterval(timer);
+      send(event);
+      res.end();
+    }
+  };
+}
+
+// Runs one provider call and delivers the result either as the classic
+// single JSON body (heartbeat-padded) or, when the client opted in with
+// `stream`, as SSE `delta` events followed by one `done`/`error` event that
+// carries exactly the payload the JSON body would have. If the browser goes
+// away mid-call (Stop button, closed tab), the provider call is aborted so the
+// local model stops generating instead of burning GPU on an unread answer.
+async function respondWithProvider(res, { stream, call, onSuccess, onError }) {
+  const abortController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) abortController.abort();
+  });
+  const signal = abortController.signal;
+
+  if (stream) {
+    const events = openEventStream(res);
+    try {
+      const result = await call({
+        signal,
+        onDelta: (text) => events.send({ type: 'delta', text }),
+        onThinking: () => events.send({ type: 'thinking' })
+      });
+      events.end({ type: 'done', ...onSuccess(result) });
+    } catch (error) {
+      events.end({ type: 'error', ...onError(error).payload });
+    }
+    return;
+  }
+
+  try {
+    const result = await withHeartbeat(res, () => call({ signal }));
+    finishJson(res, 200, onSuccess(result));
+  } catch (error) {
+    const { status, payload } = onError(error);
+    finishJson(res, status, payload);
+  }
+}
+
+function isTrue(value) {
+  return value === true || value === 'true';
+}
+
 // Only rows that completed successfully belong in a rebuilt LLM context —
 // a 'pending' row means the provider call is still in flight (shouldn't be
 // possible to observe mid-request, but excluded for safety) and a 'failed'
@@ -177,6 +248,10 @@ export function createApp() {
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => req.userEmail,
+    // The limiter is keyed by identity, never IP, so the X-Forwarded-For
+    // header Cloudflare adds is irrelevant — without this, express-rate-limit
+    // logs an ERR_ERL_UNEXPECTED_X_FORWARDED_FOR error for every tunneled request.
+    validate: { xForwardedForHeader: false },
     message: { error: 'Too many requests — please slow down' }
   });
 
@@ -278,31 +353,42 @@ export function createApp() {
       attachment: attachment ? { filename: attachment.filename } : null
     });
 
-    try {
-      const { text, usage } = await withHeartbeat(res, () => selectedProvider.sendChat(messages));
-      updateMessageStatus(userMessageId, 'complete');
-      const { createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', text, {
-        provider: selectedProvider.label,
-        sanitized: sanitizedFlag,
-        usage
-      });
-      finishJson(res, 200, {
-        conversationId: activeConversationId,
-        text,
-        provider: selectedProvider.label,
-        sanitized: sanitizedFlag,
-        usage,
-        requestedAt,
-        respondedAt
-      });
-    } catch (error) {
-      updateMessageStatus(userMessageId, 'failed');
-      finishJson(res, 502, {
-        error: `${selectedProvider.label} provider request failed: ${error.message}`,
-        conversationId: activeConversationId,
-        requestedAt
-      });
-    }
+    // `think` only means anything to the local model; Gemini's client
+    // ignores the options argument entirely.
+    const think = isTrue(req.body?.think);
+
+    await respondWithProvider(res, {
+      stream: isTrue(req.body?.stream),
+      call: (callOptions) => selectedProvider.sendChat(messages, { ...callOptions, think }),
+      onSuccess: ({ text, usage }) => {
+        updateMessageStatus(userMessageId, 'complete');
+        const { createdAt: respondedAt } = appendMessage(activeConversationId, 'assistant', text, {
+          provider: selectedProvider.label,
+          sanitized: sanitizedFlag,
+          usage
+        });
+        return {
+          conversationId: activeConversationId,
+          text,
+          provider: selectedProvider.label,
+          sanitized: sanitizedFlag,
+          usage,
+          requestedAt,
+          respondedAt
+        };
+      },
+      onError: (error) => {
+        updateMessageStatus(userMessageId, 'failed');
+        return {
+          status: 502,
+          payload: {
+            error: `${selectedProvider.label} provider request failed: ${error.message}`,
+            conversationId: activeConversationId,
+            requestedAt
+          }
+        };
+      }
+    });
   });
 
   app.post('/api/sanitize', chatLimiter, async (req, res) => {
@@ -336,10 +422,16 @@ export function createApp() {
       // sent), so the local model genericizes file content the same way it
       // genericizes typed conversation text — no separate handling needed.
       const { text: modelSanitizedText, usage } = await withHeartbeat(res, () =>
-        sendOllamaChat([
-          { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
-          { role: 'user', content: sourceText }
-        ])
+        // Thinking stays on here even though it's off by default elsewhere:
+        // this rewrite is a privacy step, so it's worth the extra time for the
+        // model to reason about which details are identifying.
+        sendOllamaChat(
+          [
+            { role: 'system', content: SANITIZE_SYSTEM_PROMPT },
+            { role: 'user', content: sourceText }
+          ],
+          { think: true }
+        )
       );
       // The local model supplies the nuanced rewrite; this deterministic
       // second pass removes names it may have missed before previewing.
@@ -492,29 +584,31 @@ export function createApp() {
       }
     ];
 
-    try {
-      const { text, usage } = await withHeartbeat(res, () => sendOllamaChat(messages));
-      const { createdAt: respondedAt } = appendMessage(conversationId, 'assistant', text, {
-        provider: 'local',
-        kind: 'incorporated',
-        feedbackMessageId,
-        feedbackKind: feedbackMessage.kind,
-        incorporationMode: mode,
-        usage
-      });
-      finishJson(res, 200, {
-        conversationId,
-        text,
-        feedbackMessageId,
-        feedbackKind: feedbackMessage.kind,
-        incorporationMode: mode,
-        usage,
-        requestedAt,
-        respondedAt
-      });
-    } catch (error) {
-      finishJson(res, 502, { error: `Incorporation failed: ${error.message}`, requestedAt });
-    }
+    await respondWithProvider(res, {
+      stream: isTrue(req.body?.stream),
+      call: (callOptions) => sendOllamaChat(messages, callOptions),
+      onSuccess: ({ text, usage }) => {
+        const { createdAt: respondedAt } = appendMessage(conversationId, 'assistant', text, {
+          provider: 'local',
+          kind: 'incorporated',
+          feedbackMessageId,
+          feedbackKind: feedbackMessage.kind,
+          incorporationMode: mode,
+          usage
+        });
+        return {
+          conversationId,
+          text,
+          feedbackMessageId,
+          feedbackKind: feedbackMessage.kind,
+          incorporationMode: mode,
+          usage,
+          requestedAt,
+          respondedAt
+        };
+      },
+      onError: (error) => ({ status: 502, payload: { error: `Incorporation failed: ${error.message}`, requestedAt } })
+    });
   });
 
   app.get('/api/conversations', (req, res) => {

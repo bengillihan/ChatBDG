@@ -97,6 +97,7 @@ function Message({ message }) {
     Boolean(message.provider) ||
     Boolean(message.sanitized) ||
     Boolean(message.kind) ||
+    Boolean(message.stopped) ||
     Boolean(message.attachmentFilename) ||
     Boolean(message.usage?.totalTokens) ||
     Boolean(message.createdAt);
@@ -124,6 +125,7 @@ function Message({ message }) {
               {message.feedbackKind ? ` · ${FEEDBACK_LABELS[message.feedbackKind] || message.feedbackKind}` : ' cloud feedback'}
             </span>
           )}
+          {message.stopped && <span className="kind-badge stopped">stopped · not saved</span>}
           {message.attachmentFilename && <span className="attachment-badge">📎 {message.attachmentFilename}</span>}
           {message.usage?.totalTokens != null && (
             <span className="token-badge" title="prompt + completion tokens for this turn">
@@ -153,13 +155,23 @@ function App() {
   const [pendingCloudConfirm, setPendingCloudConfirm] = useState(null);
   const [attachedFile, setAttachedFile] = useState(null);
   const [attachError, setAttachError] = useState(null);
+  // Off by default: hidden reasoning roughly doubles local response time for
+  // a typical question. Sticky for the session so a deep-study run doesn't
+  // need re-enabling on every message. Local-only — Gemini ignores it.
+  const [thinkHard, setThinkHard] = useState(false);
+  // The reply currently being streamed in, rendered live below the history
+  // until the server's final payload replaces it with the stored message.
+  // Mirrored in a ref so a Stop can still read the partial text from inside
+  // the async handler, where the state value would be stale.
+  const [streaming, setStreaming] = useState(null);
+  const streamedTextRef = useRef('');
   const historyEndRef = useRef(null);
   const abortControllerRef = useRef(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
     historyEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, busyAction]);
+  }, [messages, busyAction, streaming]);
 
   useEffect(() => {
     refreshConversations();
@@ -189,13 +201,39 @@ function App() {
   function startAction(name) {
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    streamedTextRef.current = '';
+    setStreaming({ text: '', thinking: false });
     setBusyAction(name);
     return controller.signal;
   }
 
   function endAction() {
     abortControllerRef.current = null;
+    streamedTextRef.current = '';
+    setStreaming(null);
     setBusyAction(null);
+  }
+
+  const streamCallbacks = {
+    onDelta(text) {
+      streamedTextRef.current += text;
+      setStreaming({ text: streamedTextRef.current, thinking: false });
+    },
+    onThinking() {
+      setStreaming((current) => ({ text: current?.text ?? '', thinking: true }));
+    }
+  };
+
+  // On Stop, the server discards the turn (nothing is persisted), but the
+  // text already streamed is still worth reading — keep it on screen,
+  // clearly marked as not saved, rather than making it vanish.
+  function keepStoppedPartial(extra = {}) {
+    const partial = streamedTextRef.current.trim();
+    if (!partial) return;
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: 'assistant', content: partial, stopped: true, ...extra }
+    ]);
   }
 
   function handleAbort() {
@@ -269,8 +307,10 @@ function App() {
         prompt,
         provider: providerToUse,
         sanitized: sanitizedFlag,
+        think: thinkHard && providerToUse === 'local',
         file,
-        signal
+        signal,
+        ...streamCallbacks
       });
       const isNewConversation = !activeConversationId;
       setActiveConversationId(response.conversationId);
@@ -288,7 +328,9 @@ function App() {
       ]);
       if (isNewConversation) refreshConversations();
     } catch (err) {
-      if (err.name !== 'AbortError') {
+      if (err.name === 'AbortError') {
+        keepStoppedPartial({ provider: providerToUse });
+      } else {
         setMessages((prev) => [
           ...prev,
           { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
@@ -481,7 +523,8 @@ function App() {
         conversationId: activeConversationId,
         feedbackMessageId: pendingFeedback.messageId,
         mode,
-        signal
+        signal,
+        ...streamCallbacks
       });
       setMessages((prev) => [
         ...prev,
@@ -500,7 +543,9 @@ function App() {
       ]);
       setPendingFeedback(null);
     } catch (err) {
-      if (err.name !== 'AbortError') {
+      if (err.name === 'AbortError') {
+        keepStoppedPartial({ provider: 'local' });
+      } else {
         setMessages((prev) => [
           ...prev,
           { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${err.message}` }
@@ -545,14 +590,21 @@ function App() {
           {messages.map((message) => (
             <Message key={message.id} message={message} />
           ))}
-          {busyAction && (
-            <div className="message assistant pending">
-              Thinking…
+          {busyAction && streaming?.text ? (
+            <div className="streaming-reply">
+              <Message message={{ role: 'assistant', content: streaming.text }} />
               <button type="button" className="stop-button" onClick={handleAbort}>
                 Stop
               </button>
             </div>
-          )}
+          ) : busyAction ? (
+            <div className="message assistant pending">
+              {streaming?.thinking ? 'Reasoning…' : 'Thinking…'}
+              <button type="button" className="stop-button" onClick={handleAbort}>
+                Stop
+              </button>
+            </div>
+          ) : null}
           <div ref={historyEndRef} />
         </div>
 
@@ -675,6 +727,16 @@ function App() {
                   Cloud
                 </button>
               </div>
+              <button
+                type="button"
+                className={`think-toggle ${thinkHard && provider === 'local' ? 'active' : ''}`}
+                aria-pressed={thinkHard && provider === 'local'}
+                onClick={() => setThinkHard((value) => !value)}
+                disabled={provider !== 'local'}
+                title="Let the local model reason before answering — slower, but better for doctrine, structure, and multi-step questions"
+              >
+                🧠 Think hard
+              </button>
               <textarea
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
